@@ -3,8 +3,8 @@
 Extract frames from trajectory and write pdb by residue ranges per chain.
 Then postprocess PDBs: renumber residues, assign chain IDs, and standardize residue names (CYX->CYS, HIE/HID->HIS).
 Usage:
-  python traj_to_pdb.py -traj trajectory.xtc -top topology.pdb \
-      -ranges 1-123 124-246 247-369 -outdir output_dir -stride 1
+  python traj_to_pdb.py --trajectory trajectory.xtc --topology topology.pdb \
+      --ranges 1-123,124-246,247-369 --outdir . --stride 1
 """
 import argparse
 import os
@@ -13,8 +13,9 @@ import MDAnalysis as mda
 from string import ascii_uppercase
 from tqdm import tqdm
 
+
 def write_frame_by_ranges(universe, frame_index, residue_ranges, output_dir):
-    """Extract one frame and write a PDB with specified residue ranges as chains."""
+    """Extract one frame and write a pdb with specified residue ranges as chains."""
     universe.trajectory[frame_index]
     atoms = universe.atoms
     os.makedirs(output_dir, exist_ok=True)
@@ -25,8 +26,7 @@ def write_frame_by_ranges(universe, frame_index, residue_ranges, output_dir):
         for chain_idx, (start, end) in enumerate(residue_ranges):
             chain_id = ascii_uppercase[chain_idx % len(ascii_uppercase)]
             selection = atoms.select_atoms(f"resid {start}:{end}")
-            # map original residue indices to new sequential numbering
-            res_map = {res.ix: idx+1 for idx, res in enumerate(selection.residues)}
+            res_map = {res.ix: idx + 1 for idx, res in enumerate(selection.residues)}
 
             for residue in selection.residues:
                 new_resid = res_map[residue.ix]
@@ -51,36 +51,38 @@ def write_frame_by_ranges(universe, frame_index, residue_ranges, output_dir):
                     )
                     f.write(line)
                     atom_serial += 1
-        f.write("TER\nEND\n")
+            # end of one chain
+            f.write("TER\n")
+        # final end record
+        f.write("END\n")
     return filename
 
 
-def parse_ranges(range_strings):
-    """Parse list of 'start-end' strings into tuples of ints."""
+def parse_ranges(ranges_string):
+    """Parse comma-separated 'start-end' strings into tuples of ints."""
     ranges = []
-    for r in range_strings:
+    for r in ranges_string.split(','):
         start, end = r.split('-')
         ranges.append((int(start), int(end)))
     return ranges
 
 
 def process_pdb_file(file_path):
-    """Renumber residues, assign chain ID, reset counters per chain."""
+    """Renumber residues sequentially, assign chain IDs and reset per chain."""
     with open(file_path, 'r') as infile:
         lines = infile.readlines()
 
     new_lines = []
     current_chain = 'A'
-    residue_counter = 1
+    residue_counter = 0
     prev_resnum = None
 
     for line in lines:
         if line.startswith(('ATOM', 'HETATM')):
             resnum = line[22:26].strip()
             if resnum != prev_resnum:
+                residue_counter += 1
                 prev_resnum = resnum
-                if line.startswith('ATOM') and residue_counter != 1:
-                    residue_counter += 1
             new_line = (
                 line[:21]
                 + current_chain
@@ -90,8 +92,9 @@ def process_pdb_file(file_path):
             new_lines.append(new_line)
         elif line.startswith('TER'):
             new_lines.append(line)
+            # advance to next chain
             current_chain = chr(ord(current_chain) + 1)
-            residue_counter = 1
+            residue_counter = 0
             prev_resnum = None
         else:
             new_lines.append(line)
@@ -115,15 +118,20 @@ def standardize_residue_names(directory, extensions=None):
             with open(fname, 'w') as f:
                 f.write(content)
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert trajectory frames to pdb by chain ranges, then postprocess."
     )
-    parser.add_argument('-traj', '--trajectory', required=True, help='Trajectory file (xtc, dcd)')
-    parser.add_argument('-top', '--topology', required=True, help='Topology file (pdb, gro)')
-    parser.add_argument('-ranges', nargs='+', required=True, help='Residue ranges per chain (start-end)')
-    parser.add_argument('-outdir', default='.', help='Output directory')
-    parser.add_argument('-stride', type=int, default=1, help='Frame stride')
+    parser.add_argument('--trajectory', required=True, help='Trajectory file (xtc, dcd)')
+    parser.add_argument('--topology', required=True, help='Topology file (pdb, gro)')
+    parser.add_argument(
+        '--ranges',
+        required=True,
+        help='Residue ranges per chain, e.g., 1-123,124-246,247-369'
+    )
+    parser.add_argument('--outdir', default='.', help='Output directory')
+    parser.add_argument('--stride', type=int, default=1, help='Frame stride')
     args = parser.parse_args()
 
     residue_ranges = parse_ranges(args.ranges)
@@ -136,11 +144,9 @@ def main():
         pdb = write_frame_by_ranges(u, idx, residue_ranges, args.outdir)
         pdb_files.append(pdb)
 
-    # postprocess each PDB: renumber and chain-id fix
     for pdb in pdb_files:
         process_pdb_file(pdb)
 
-    # standardize residue names in all outputs
     standardize_residue_names(args.outdir)
 
     print(f"Processed {len(pdb_files)} frames into {args.outdir}")
