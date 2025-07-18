@@ -1,6 +1,8 @@
 # High-frequency-Contacts
 We provide a set of scripts to calculate high frequency native contacts from a MD trayectories.
 
+Example:
+
 To better capture the nanomechanical behavior of this complex, we can use the AA-MD simulation used in Part I. This simulation will allow to determine the most persistent protein contacts, as described in [8]. The AA-MD trajectory is located in the All-atom directory. We will use `traj_to_pdb.py` and `contact_calculation.py` (located in the template folder) to convert the trajectory to pdb format and to calculate high-frequency contacts as follows:
 
 ```bash
