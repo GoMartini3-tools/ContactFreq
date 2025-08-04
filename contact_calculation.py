@@ -30,6 +30,8 @@ from tqdm import tqdm
 from collections import defaultdict
 import MDAnalysis as mda
 from MDAnalysis.lib.distances import distance_array
+from datetime import datetime
+
 
 
 def process_contact_map(args):
@@ -209,6 +211,12 @@ def load_itp(path):
 
 
 def main():
+    import sys
+    from datetime import datetime
+
+    # Log the command used to run the script
+    with open("run.log", "a") as log_file:
+        log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Command: {' '.join(sys.argv)}\n")
     parser = argparse.ArgumentParser(description="Run full contact analysis and build coarse-grained model")
     parser.add_argument("--short", type=float, default=3.0, help="Minimum distance cutoff in angstroms")
     parser.add_argument("--long", type=float, default=11.0, help="Maximum distance cutoff in angstroms")
