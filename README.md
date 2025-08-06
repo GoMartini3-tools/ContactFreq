@@ -46,7 +46,7 @@ python contact_calculation.py --short 3.0 --long 11.0 --cm /path/to/contact_map 
 
 * --short and --long define the minimum and maximum distance cutoffs for contact detection (in Å).
 * --cm points to the directory containing the contact_map executable. Available here [here](https://zenodo.org/records/3817447) or [here](https://github.com/Martini-Force-Field-Initiative/GoMartini/tree/main/ContactMapGenerator)
-* --type sets the analysis scope (`both`, `intra`, or `inter`).
+* --type sets the analysis scope (`both`, `intra`, or `inter`). Note that it must be used `intra` for single proteins (monomers).
 * --cpus defines the number of parallel workers for contact computation.
 * --threshold is the minimum frequency to classify a contact as high-frequency (0.7 is recommended).
 * --merge lists the chains to merge prior to running martinize2.
