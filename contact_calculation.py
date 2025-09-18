@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#updated: 18-07-2025
+# updated: 18-07-2025
 """
 Comprehensive contact analysis pipeline including martinize2.
 
@@ -12,7 +12,8 @@ This script performs the following steps:
   6. Run martinize2 to build coarse-grained topology and structure
   7. Build bead index, write mock ITP and filter real ITP
   8. Measure distances for missing contacts and write them to a separate ITP
-  9. Move final .txt, .pdb and .map outputs into an output_files folder
+  9. Write per-frame counts of high-frequency contacts
+ 10. Move final .txt, .pdb and .map outputs into an output_files folder
 
 Usage:
   python contact_analysis.py [options]
@@ -31,7 +32,6 @@ from collections import defaultdict
 import MDAnalysis as mda
 from MDAnalysis.lib.distances import distance_array
 from datetime import datetime
-
 
 
 def process_contact_map(args):
@@ -111,23 +111,37 @@ def annotate(inp, outp, keep_same, keep_diff):
 
 
 def analyze_frequency(pattern, out_norm, out_high, thr):
+    """
+    Build frequency over all annotated_* files.
+
+    Note: the "Res1" and "Res2" columns in the normalized/high files below
+    are actually the per-chain indices i1 and i2 from the annotated lines.
+    Chains are Chain1 and Chain2. This is intentional so that our canonical
+    match uses (chain, index) pairs which are unambiguous.
+    """
     counts = defaultdict(int)
     records = []
     for fn in glob.glob(pattern):
         lines = open(fn).read().splitlines()
         records.append([l for l in lines if l and not l.startswith("Res1")])
-    total = len(records)
+    total = len(records) if records else 1
     for rec in records:
         for l in rec:
             c = l.split()
             if len(c) < 6:
                 continue
-            key = (c[2], c[5], c[0], c[3], c[1], c[4])
+            # From annotated line:
+            # c[1]=c1, c[2]=i1, c[4]=c2, c[5]=i2, c[0]=r1, c[3]=r2
+            # We keep the key in terms of indices and chains to avoid ambiguity.
+            key = (c[2], c[5], c[1], c[4], c[0], c[3])  # (i1, i2, c1, c2, r1, r2)
             counts[key] += 1
+
     with open(out_norm, "w") as out:
         out.write("Res1\tRes2\tFreq\tChain1\tChain2\tResname1\tResname2\n")
         for k, v in counts.items():
-            out.write(f"{k[0]}\t{k[1]}\t{v/total:.2f}\t{k[4]}\t{k[5]}\t{k[2]}\t{k[3]}\n")
+            i1, i2, c1, c2, r1, r2 = k
+            out.write(f"{i1}\t{i2}\t{v/total:.2f}\t{c1}\t{c2}\t{r1}\t{r2}\n")
+
     with open(out_high, "w") as out:
         header = open(out_norm).readline()
         out.write(header)
@@ -136,41 +150,97 @@ def analyze_frequency(pattern, out_norm, out_high, thr):
                 out.write(l + "\n")
 
 
+# ---------- Canonical contact key helpers ----------
+
+def canonical_key_from_high_line(line):
+    """
+    From a high_* file line:
+      columns: i1  i2  freq  c1  c2  r1  r2
+    return frozenset({(c1, i1), (c2, i2)})
+    """
+    p = line.split()
+    if len(p) < 5:
+        return None
+    i1 = p[0]
+    i2 = p[1]
+    c1 = p[3]
+    c2 = p[4]
+    return frozenset({(c1, i1), (c2, i2)})
+
+
+def canonical_key_from_annotated_line(line):
+    """
+    From an annotated_* line:
+      0:r1  1:c1  2:i1  3:r2  4:c2  5:i2  ...
+    return frozenset({(c1, i1), (c2, i2)})
+    """
+    p = line.split()
+    if len(p) < 6:
+        return None
+    i1 = p[2]
+    i2 = p[5]
+    c1 = p[1]
+    c2 = p[4]
+    return frozenset({(c1, i1), (c2, i2)})
+
+
 def select_reference_frame(highfile):
-    pairs = set()
-    for line in open(highfile).read().splitlines()[1:]:
-        c = line.split()
-        pairs.add((c[0], c[3], c[1], c[4]))
+    """
+    Pick the annotated_* file (frame) that contains the most high-frequency contacts.
+    Also writes best_frame.txt with the summary of the winner.
+    """
+    high_keys = set()
+    with open(highfile) as fh:
+        next(fh, None)  # skip header
+        for line in fh:
+            key = canonical_key_from_high_line(line)
+            if key:
+                high_keys.add(key)
+
     files = glob.glob("annotated_*.txt")
     if not files:
         raise FileNotFoundError("No annotated files found")
+
     best, best_cnt = None, -1
     for fn in files:
-        cnt = sum(1 for L in open(fn).read().splitlines() if tuple(L.split()[2:6]) in pairs)
+        cnt = 0
+        with open(fn) as f:
+            for L in f:
+                if not L.strip() or L.startswith("Res1"):
+                    continue
+                k = canonical_key_from_annotated_line(L)
+                if k and k in high_keys:
+                    cnt += 1
         if cnt > best_cnt:
             best, best_cnt = fn, cnt
+
     m = re.search(r"frame_(\d+)", os.path.basename(best))
-    return m.group(1), best
+    idx = m.group(1) if m else "NA"
+
+    total_high = len(high_keys) if high_keys else 1
+    with open("best_frame.txt", "w") as out:
+        out.write("Frame\tHighContacts\tFractionOfHighSet\tFile\n")
+        out.write(f"{idx}\t{best_cnt}\t{best_cnt/total_high:.4f}\t{os.path.basename(best)}\n")
+
+    return idx, best
 
 
 def run_martinize(idx, pdb_dir, merge, dssp, goeps, src):
     atom = f"{pdb_dir}/frame_{idx}.pdb"
     cg = f"{pdb_dir}/frame_{idx}_CG.pdb"
-    # build martinize2 command
     cmd = ["martinize2", "-f", atom]
     if merge:
         cmd += ["-merge", merge]
     cmd += ["-o", "topol.top", "-x", cg,
-            "-dssp", dssp,
             "-p", "backbone", "-ff", "martini3001",
             "-cys", "auto", "-ignh", "-from", src,
             "-go", "-name", "molecule_0", "-go-eps", str(goeps),
             "-maxwarn", "100"]
+    if dssp:  # <-- solo si el usuario lo pasó
+        cmd += ["-dssp", dssp]
     print("Running martinize2:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     return atom
-
-
 
 def build_index(pdb):
     by_chain = defaultdict(list)
@@ -193,9 +263,12 @@ def write_mock(highfile, pdb, itp_out):
         next(hf)
         for line in hf:
             c = line.split()
-            r1, r2 = c[0], c[1]
+            # c: i1 i2 freq c1 c2 r1 r2
+            r1, r2 = c[5], c[6] if len(c) > 6 else ("", "")
             ch1, ch2 = c[3], c[4]
-            i1, i2 = inv.get((r1, ch1)), inv.get((r2, ch2))
+            # Map using residue index per chain from the PDB
+            i1 = inv.get((r1, ch1))
+            i2 = inv.get((r2, ch2))
             if i1 and i2:
                 out.write(f"molecule_0_{i1} molecule_0_{i2} 1 0.00000000 0.00000000 ; mock\n")
 
@@ -210,6 +283,42 @@ def load_itp(path):
     return s
 
 
+def write_high_counts_per_frame(highfile, annotated_pattern, out_path):
+    """
+    Count, for each annotated frame file, how many of its contacts
+    belong to the high-frequency set, and write a table.
+    Uses order-independent canonical keys based on (chain, index).
+    """
+    high_keys = set()
+    with open(highfile) as fh:
+        next(fh, None)
+        for line in fh:
+            k = canonical_key_from_high_line(line)
+            if k:
+                high_keys.add(k)
+    total_high = len(high_keys) if high_keys else 1
+
+    files = []
+    for fn in glob.glob(annotated_pattern):
+        m = re.search(r"frame_(\d+)", os.path.basename(fn))
+        if m:
+            files.append((int(m.group(1)), fn))
+    files.sort(key=lambda x: x[0])
+
+    with open(out_path, "w") as out:
+        out.write("Frame\tHighContacts\tFractionOfHighSet\tFile\n")
+        for idx, fn in files:
+            cnt = 0
+            with open(fn) as f:
+                for L in f:
+                    if not L.strip() or L.startswith("Res1"):
+                        continue
+                    k = canonical_key_from_annotated_line(L)
+                    if k and k in high_keys:
+                        cnt += 1
+            out.write(f"{idx}\t{cnt}\t{(cnt/total_high):.4f}\t{os.path.basename(fn)}\n")
+
+
 def main():
     import sys
     from datetime import datetime
@@ -217,6 +326,7 @@ def main():
     # Log the command used to run the script
     with open("run.log", "a") as log_file:
         log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Command: {' '.join(sys.argv)}\n")
+
     parser = argparse.ArgumentParser(description="Run full contact analysis and build coarse-grained model")
     parser.add_argument("--short", type=float, default=3.0, help="Minimum distance cutoff in angstroms")
     parser.add_argument("--long", type=float, default=11.0, help="Maximum distance cutoff in angstroms")
@@ -225,7 +335,8 @@ def main():
     parser.add_argument("--cpus", type=int, default=15, help="Number of parallel processes")
     parser.add_argument("--threshold", type=float, default=0.7, help="Frequency threshold for high-frequency contacts")
     parser.add_argument("--merge", type=str, default=None, help="Chains to merge or 'all'")
-    parser.add_argument("--dssp", dest="dssp_path", default="mkdssp", help="Path to dssp executable")
+    parser.add_argument("--dssp", dest="dssp_path", default=None,
+                    help="Path to dssp executable (optional). If not set, DSSP is skipped")
     parser.add_argument("--go-eps", dest="go_eps", type=float, default=9.414, help="Epsilon for go potential")
     parser.add_argument("--from", dest="md_source", choices=["amber","charmm"], default="amber",
                         help="Source force field for martinize2")
@@ -249,50 +360,60 @@ def main():
         filtered.append(out_txt)
 
     for f in filtered:
-        suffix = "_intra" if args.type=="intra" else "_inter" if args.type=="inter" else ""
-        outp = f"annotated_{f.replace('.txt', suffix+'.txt')}"
+        suffix = "_intra" if args.type == "intra" else "_inter" if args.type == "inter" else ""
+        outp = f"annotated_{f.replace('.txt', suffix + '.txt')}"
         annotate(f, outp,
-                 keep_same=(args.type in ("both","intra")),
-                 keep_diff=(args.type in ("both","inter")))
+                 keep_same=(args.type in ("both", "intra")),
+                 keep_diff=(args.type in ("both", "inter")))
+
     norm_file = f"normalized_{args.type}.txt"
     high_file = f"high_{args.type}.txt"
     analyze_frequency("annotated_*.txt", norm_file, high_file, args.threshold)
 
-    frame_idx,_ = select_reference_frame(high_file)
+    # Per-frame counts and best frame report (uses canonical contact keys)
+    write_high_counts_per_frame(high_file, "annotated_*.txt", "high_counts_per_frame.txt")
+    frame_idx, _ = select_reference_frame(high_file)
+
     atom_pdb = run_martinize(frame_idx, ".", args.merge, args.dssp_path, args.go_eps, args.md_source)
 
     mock_itp = f"go_nbparams_mock_{args.type}.itp"
     write_mock(high_file, atom_pdb, mock_itp)
     inv_map = build_index(atom_pdb)
-    inv_map_inv = {v:k[1] for k,v in inv_map.items()}
+    inv_map_inv = {v: k[1] for k, v in inv_map.items()}
 
     # load high-frequency pairs based on type
     high_pairs = set()
-    if args.type in ("inter","intra","both"):
+    if args.type in ("inter", "intra", "both"):
         with open(high_file) as hf:
             next(hf)
             for line in hf:
                 p = line.split()
-                r1,r2 = p[0],p[1]
-                ch1,ch2 = p[3],p[4]
-                i1 = inv_map.get((r1,ch1))
-                i2 = inv_map.get((r2,ch2))
+                if len(p) < 5:
+                    continue
+                # Use indices in CG space
+                r1_idx = p[0]
+                r2_idx = p[1]
+                ch1 = p[3]
+                ch2 = p[4]
+                # map back to sequential bead ids after martinize
+                i1 = inv_map.get((r1_idx, ch1))
+                i2 = inv_map.get((r2_idx, ch2))
                 if i1 and i2:
-                    high_pairs.add((min(i1,i2), max(i1,i2)))
+                    high_pairs.add((min(i1, i2), max(i1, i2)))
 
     real_pairs = load_itp("go_nbparams.itp")
-    shutil.copy("go_nbparams.itp","go_nbparams.itp.bak")
-    with open("go_nbparams.itp.bak") as rf, open("go_nbparams.itp","w") as wf:
+    shutil.copy("go_nbparams.itp", "go_nbparams.itp.bak")
+    with open("go_nbparams.itp.bak") as rf, open("go_nbparams.itp", "w") as wf:
         for line in rf:
             if line.startswith("molecule_0_"):
-                a,b = line.split()[:2]
-                i1,i2 = int(a.rsplit("_",1)[1]), int(b.rsplit("_",1)[1])
-                idx = (min(i1,i2), max(i1,i2))
+                a, b = line.split()[:2]
+                i1, i2 = int(a.rsplit("_", 1)[1]), int(b.rsplit("_", 1)[1])
+                idx = (min(i1, i2), max(i1, i2))
                 chain_relation = (inv_map_inv[i1] == inv_map_inv[i2])
-                if args.type=="inter":
+                if args.type == "inter":
                     if chain_relation or idx in high_pairs:
                         wf.write(line)
-                elif args.type=="intra":
+                elif args.type == "intra":
                     if not chain_relation or idx in high_pairs:
                         wf.write(line)
                 else:  # both
@@ -305,42 +426,48 @@ def main():
     missing = mock_pairs - real_pairs
     missing_info = []
     for line in open(high_file).read().splitlines():
-        if line.startswith("Res1"): continue
-        p=line.split()
-        r1,r2=p[0],p[1]
-        ch1,ch2=p[3],p[4]
-        i1,i2 = inv_map.get((r1,ch1)), inv_map.get((r2,ch2))
-        if i1 and i2 and (min(i1,i2),max(i1,i2)) in missing:
-            missing_info.append((r1,ch1,r2,ch2))
+        if line.startswith("Res1"):
+            continue
+        p = line.split()
+        if len(p) < 5:
+            continue
+        r1, r2 = p[0], p[1]
+        ch1, ch2 = p[3], p[4]
+        i1, i2 = inv_map.get((r1, ch1)), inv_map.get((r2, ch2))
+        if i1 and i2 and (min(i1, i2), max(i1, i2)) in missing:
+            missing_info.append((r1, ch1, r2, ch2))
 
     pdb_files = sorted(f for f in glob.glob("frame_*.pdb") if not f.endswith("_CG.pdb"))
-    dist_dict = {mi:[] for mi in missing_info}
+    dist_dict = {mi: [] for mi in missing_info}
     for pdb in tqdm(pdb_files, desc="Measuring missing distances"):
         u = mda.Universe(pdb)
-        for r1,c1,r2,c2 in missing_info:
+        for r1, c1, r2, c2 in missing_info:
             sel1 = u.select_atoms(f"segid {c1} and resid {r1} and name CA")
             sel2 = u.select_atoms(f"segid {c2} and resid {r2} and name CA")
             if sel1 and sel2:
-                d=distance_array(sel1.positions, sel2.positions)[0,0]/10.0
-                dist_dict[(r1,c1,r2,c2)].append(d)
+                d = distance_array(sel1.positions, sel2.positions)[0, 0] / 10.0
+                dist_dict[(r1, c1, r2, c2)].append(d)
 
     missing_itp = "missing_high_freq.itp"
-    with open(missing_itp,"w") as wf:
+    with open(missing_itp, "w") as wf:
         wf.write("; missing high-frequency contacts\n")
-        for (r1,c1,r2,c2),ds in dist_dict.items():
-            avg=np.mean(ds)
-            rmin=avg/(2**(1/6))
-            i1,i2=inv_map[(r1,c1)],inv_map[(r2,c2)]
+        for (r1, c1, r2, c2), ds in dist_dict.items():
+            avg = np.mean(ds)
+            rmin = avg / (2 ** (1 / 6))
+            i1, i2 = inv_map[(r1, c1)], inv_map[(r2, c2)]
             wf.write(f"molecule_0_{i1} molecule_0_{i2} 1 {rmin:.8f} {args.go_eps:.8f} ; go bond {avg:.4f}\n")
 
-    outdir="output_files"
-    os.makedirs(outdir,exist_ok=True)
-    for ext in("*.txt","*.map","*.pdb"):
+    outdir = "output_files"
+    os.makedirs(outdir, exist_ok=True)
+    for ext in ("*.txt", "*.map", "*.pdb"):
         for fn in glob.glob(ext):
-            if fn.endswith("_CG.pdb"): continue
-            shutil.move(fn,os.path.join(outdir,fn))
+            if fn.endswith("_CG.pdb"):
+                continue
+            shutil.move(fn, os.path.join(outdir, fn))
 
     print("Done.")
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
+
