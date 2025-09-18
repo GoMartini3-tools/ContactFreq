@@ -232,15 +232,15 @@ def run_martinize(idx, pdb_dir, merge, dssp, goeps, src):
     if merge:
         cmd += ["-merge", merge]
     cmd += ["-o", "topol.top", "-x", cg,
-            "-dssp", dssp,
             "-p", "backbone", "-ff", "martini3001",
             "-cys", "auto", "-ignh", "-from", src,
             "-go", "-name", "molecule_0", "-go-eps", str(goeps),
             "-maxwarn", "100"]
+    if dssp:  # <-- solo si el usuario lo pasó
+        cmd += ["-dssp", dssp]
     print("Running martinize2:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     return atom
-
 
 def build_index(pdb):
     by_chain = defaultdict(list)
@@ -335,7 +335,8 @@ def main():
     parser.add_argument("--cpus", type=int, default=15, help="Number of parallel processes")
     parser.add_argument("--threshold", type=float, default=0.7, help="Frequency threshold for high-frequency contacts")
     parser.add_argument("--merge", type=str, default=None, help="Chains to merge or 'all'")
-    parser.add_argument("--dssp", dest="dssp_path", default="mkdssp", help="Path to dssp executable")
+    parser.add_argument("--dssp", dest="dssp_path", default=None,
+                    help="Path to dssp executable (optional). If not set, DSSP is skipped")
     parser.add_argument("--go-eps", dest="go_eps", type=float, default=9.414, help="Epsilon for go potential")
     parser.add_argument("--from", dest="md_source", choices=["amber","charmm"], default="amber",
                         help="Source force field for martinize2")
