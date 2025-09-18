@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Extract frames from trajectory and write pdb by residue ranges per chain.
-Then postprocess PDBs: renumber residues, assign chain IDs, and standardize residue names (CYX->CYS, HIE/HID->HIS).
+Then postprocess PDBs: renumber residues, assign chain IDs, and standardize residue names.
+
 Usage:
   python traj_to_pdb.py --trajectory trajectory.xtc --topology topology.pdb \
       --ranges 1-123,124-246,247-369 --outdir . --stride 1
@@ -26,12 +27,18 @@ def write_frame_by_ranges(universe, frame_index, residue_ranges, output_dir):
         for chain_idx, (start, end) in enumerate(residue_ranges):
             chain_id = ascii_uppercase[chain_idx % len(ascii_uppercase)]
             selection = atoms.select_atoms(f"resid {start}:{end}")
-            res_map = {res.ix: idx + 1 for idx, res in enumerate(selection.residues)}
+            # Map original residue ids to sequential ids per chain
+            res_map = {res.resindex: idx + 1 for idx, res in enumerate(selection.residues)}
 
             for residue in selection.residues:
-                new_resid = res_map[residue.ix]
+                new_resid = res_map[residue.resindex]
                 for atom in residue.atoms:
-                    element = atom.name.strip()[0] if atom.name.strip() else 'X'
+                    try:
+                        element = (atom.element or '').strip()
+                    except Exception:
+                        element = ''
+                    if not element:
+                        element = atom.name.strip()[:2].strip() or 'X'
                     line = (
                         "{:<6s}{:>5d} {:<4s}{:1s}{:>3s} {:1s}"
                         "{:>4d}    "
@@ -47,13 +54,11 @@ def write_frame_by_ranges(universe, frame_index, residue_ranges, output_dir):
                         new_resid,
                         atom.position[0], atom.position[1], atom.position[2],
                         1.00, 0.00,
-                        element
+                        element.rjust(2)[:2]
                     )
                     f.write(line)
                     atom_serial += 1
-            # end of one chain
             f.write("TER\n")
-        # final end record
         f.write("END\n")
     return filename
 
@@ -92,7 +97,6 @@ def process_pdb_file(file_path):
             new_lines.append(new_line)
         elif line.startswith('TER'):
             new_lines.append(line)
-            # advance to next chain
             current_chain = chr(ord(current_chain) + 1)
             residue_counter = 0
             prev_resnum = None
@@ -104,17 +108,15 @@ def process_pdb_file(file_path):
 
 
 def standardize_residue_names(directory, extensions=None):
-    """Replace nonstandard residue names across files in a directory."""
+    """Replace CYX with CYS across files in a directory."""
     if extensions is None:
         extensions = ['pdb', 'txt', 'map']
-    repl = {'CYX': 'CYS', 'HIE': 'HIS', 'HID': 'HIS'}
     for ext in extensions:
         pattern = os.path.join(directory, f"*.{ext}")
         for fname in glob.glob(pattern):
             with open(fname, 'r') as f:
                 content = f.read()
-            for old, new in repl.items():
-                content = content.replace(old, new)
+            content = content.replace("CYX", "CYS")
             with open(fname, 'w') as f:
                 f.write(content)
 
@@ -149,8 +151,9 @@ def main():
 
     standardize_residue_names(args.outdir)
 
-    print(f"Processed {len(pdb_files)} frames into {args.outdir}")
+    print(f"Processed {len(pdb_files)} frames into {args.outdir} (CYX -> CYS applied)")
 
 
 if __name__ == '__main__':
     main()
+
