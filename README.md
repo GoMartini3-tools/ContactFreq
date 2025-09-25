@@ -1,55 +1,182 @@
-# High-frequency-Contacts
-We provide a set of scripts to calculate high frequency native contacts from a MD trayectories.
+# High-frequency-contacts
 
-Example:
+Tools to compute **high-frequency native contacts** from MD trajectories and build a coarse-grained (CG) Gō-Martini model with **martinize2**.
 
-To better capture the nanomechanical behavior of this complex, we can use the AA-MD simulation used in Part I. This simulation will allow to determine the most persistent protein contacts, as described in [8]. The AA-MD trajectory is located in the All-atom directory. We will use `traj_to_pdb.py` and `contact_calculation.py` (located in the template folder) to convert the trajectory to pdb format and to calculate high-frequency contacts as follows:
+The workflow converts a trajectory into per-frame structures (PDB/CIF), computes per-frame contact maps, identifies persistent (high-frequency) contacts, selects a reference frame, and generates CG topology/parameters. It supports **PDB or CIF** frames natively and uses **nm** for contact thresholds.
 
-```bash
-python traj_to_pdb.py  --trajectory 6ZH9_WT_dry_100.nc --topology 6ZH9_WT_dry.parm7  --ranges 1-195,195-323 --outdir . --stride 1
-```
+---
 
-* --trajectory specifies the trajectory file (e.g., .xtc, .dcd). In this case, the file 6ZH9_WT_dry.nc is located in the 6ZH9_AA folder, with each frame representing 1 ns.
+## Requirements
 
-* --topology refers to the coordinate file (e.g., .pdb, .gro)
+- Python 3.8+
+- Packages: `MDAnalysis`, `numpy`, `tqdm`
+- `contact_map` executable (from GoMartini ContactMapGenerator)
+- `martinize2` in your `$PATH`
+- (Optional) `mkdssp` for secondary structure
 
-* --ranges defines the residue blocks corresponding to each chain (e.g., A: 2-196, B: 197-325)
+Get `contact_map`:
 
-* --outdir sets the output directory for the generated PDB files
+- Zenodo: https://zenodo.org/records/3817447
+- GitHub: https://github.com/Martini-Force-Field-Initiative/GoMartini/tree/main/ContactMapGenerator
 
-* --stride allows skipping n frames
+---
 
+## Step 1 - dump trajectory frames
 
-The `contact_calculation.py` script automates the analysis of PDB trajectory frames to generate a CG topology with filtered high-frequency contacts. It performs the following steps:
-
-* Contact detection: Identifies all frame_*.pdb files and runs contact_map in parallel to compute atom contacts per frame.
-
-* Annotation: Labels contacts as intra- or inter-chain, removes symmetric duplicates, and annotates files accordingly.
-
-* Frequency calculation: Aggregates all contacts to compute their framewise frequency. Writes normalized_type.txt and selects high-frequency contacts (--threshold) into high_type.txt.
-
-* Reference selection: Identifies the frame with the most high-frequency contacts to serve as input for coarse-graining.
-
-* Coarse-graining and Gō potential generation: Runs martinize2 on the selected reference. Constructs a virtual-site Gō model, filters native contacts, and builds go_nbparams.itp.
-
-* Optional optimization: Contacts missing from the reference but exceeding the threshold are appended to go_nbparams.itp under a clearly marked section. This can be removed manually if undesired.
-
-Output organization: Moves all .txt, .map, and intermediate .pdb files (except the final CG PDB) into the output_files/ folder.
-
-
-
+Use `traj_to_pdb.py` to write frames as `frame_####.pdb` (or `.cif`).
 
 ```bash
-
-python contact_calculation.py --short 3.0 --long 11.0 --cm /path/to/contact_map --type inter --cpus 15 --threshold 0.7 --merge all --dssp /usr/bin/mkdssp --go-eps 15.0
+python traj_to_pdb.py   --trajectory 6ZH9_WT_dry_100.nc   --topology   6ZH9_WT_dry.parm7   --ranges     1-195,195-323   --outdir     .   --stride     1
 ```
 
-* --short and --long define the minimum and maximum distance cutoffs for contact detection (in Å).
-* --cm points to the directory containing the contact_map executable. Available here [here](https://zenodo.org/records/3817447) or [here](https://github.com/Martini-Force-Field-Initiative/GoMartini/tree/main/ContactMapGenerator)
-* --type sets the analysis scope (`both`, `intra`, or `inter`). Note that it must be used `intra` for single proteins (monomers).
-* --cpus defines the number of parallel workers for contact computation.
-* --threshold is the minimum frequency to classify a contact as high-frequency (0.7 is recommended).
-* --merge lists the chains to merge prior to running martinize2.
-* --dssp provides the path to the DSSP executable (e.g., /usr/bin/mkdssp).
-* --go-eps sets the epsilon value (in kJ/mol) for the Gō-model potential (a default value of 12.0 or 15.0 is suggested).
-* --from indicates the origin of the topology (amber or charmm).
+**Options:**
+
+- `--trajectory` trajectory file (e.g., `.xtc`, `.dcd`, `.nc`)
+- `--topology` topology or coordinates (e.g., `.pdb`, `.gro`, `.parm7`)
+- `--ranges` residue blocks per chain (e.g., `2-196,197-325`)
+- `--outdir` where frames are written
+- `--stride` keep every n-th frame
+
+Frames must be named `frame_0001.pdb`, `frame_0002.pdb`, … (or `.cif`).
+If both `.pdb` and `.cif` exist for the same index, PDB is preferred.
+
+---
+
+## Step 2 - compute high-frequency contacts and build CG model
+
+The main script is `contact_analysis.py` (formerly `contact_calculation.py`). It:
+
+- Generates `.map` files for each frame (parallelized).
+- Filters contacts using nm thresholds (`--go-low`, `--go-up`).
+- Annotates intra and inter contacts and removes duplicates.
+- Computes contact frequencies across frames and writes:
+  - `normalized_<type>.txt`
+  - `high_<type>.txt` (≥ `--threshold`)
+- Selects the frame with the most high-frequency contacts.
+- Runs `martinize2` with `-go <frame_X.map>` matching `-f <frame_X.pdb|cif>`.
+- Produces and filters `go_nbparams.itp`.
+- Computes average CA–CA distances (in nm) for high-frequency pairs missing from the selected ITP and writes `missing_high_freq.itp`.
+- Keeps only pairs with average distance ≤ `--go-up`.
+- (Optional) `--add-missing` appends `missing_high_freq.itp` entries (with header) into `go_nbparams.itp`.
+- Writes per-frame counts for high and Gō sets and moves outputs into `output_files/`.
+
+---
+
+## Typical run
+
+```bash
+python contact_analysis.py   --cm /path/to/contact_map   --type inter   --cpus 15   --threshold 0.7   --merge all   --dssp /usr/bin/mkdssp   --from charmm   --go-eps 15.0   --go-low 0.3   --go-up 1.1   --add-missing
+```
+
+---
+
+## Key options (with defaults)
+
+- `--cm` (str, `"."`): directory containing `contact_map`
+- `--type` (`both|intra|inter`, `"both"`): scope of contacts  
+  *For monomers, use `intra`.*
+- `--cpus` (int, `15`): parallel workers for mapping
+- `--threshold` (float, `0.7`): high-frequency cutoff
+- `--merge` (`all|None`, `None`): chains to merge before martinize2 (`all` merges every chain)
+- `--dssp` (str|None, `None`): path to `mkdssp`
+- `--from` (`amber|charmm`, `"amber"`): source force field for martinize2
+- `--posres` (`none|all|backbone`, `"none"`): position restraints
+
+**Gō model and contact filtering (nm):**
+
+- `--go-eps` (float, `9.414`): epsilon for Gō bias (kJ/mol)
+- `--go-low` (float, `0.3`): minimum contact distance threshold
+- `--go-up` (float, `1.1`): maximum contact distance threshold
+- `--go-res-dist` (int|None, `None`): remove contacts below a graph distance
+- `--go-backbone` (str, `"BB"`): backbone bead name for Gō site
+- `--go-atomname` (str, `"CA"`): virtual site atom name
+- `--go-write-file` (flag or str): ask martinize2 to write its contact map if it computes it
+
+**Water bias and IDR:**
+
+- `--water-bias` (flag): enable water bias
+- `--water-bias-eps` (list of `str`): e.g., `H:3.6 C:2.1 idr:2.1`
+- `--id-regions` (list of `str`): e.g., `A-10:45 60:80`
+- `--idr-tune` (flag): deprecated passthrough to martinize2
+
+**Protein description and edits:**
+
+- `--noscfix` (flag), `--scfix` (flag), `--cys` (str)
+- `--mutate` (list of `str`): e.g., `A-PHE45:ALA PHE30:ALA`
+- `--modify` (list of `str`): e.g., `A-ASP45:ASP0 ASP:ASP0 +HSE`
+- `--nter`, `--cter`, `--nt`: terminus patches
+
+**Diagnostics:**
+
+- `--write-graph`, `--write-repair`, `--write-canon`
+- `-v` (repeatable): increase martinize2 verbosity
+- `--maxwarn` (list of `int`)
+
+**Reference frame:**
+
+- `--force-frame` (int or `None`): use a specific `frame_####` instead of auto-selection
+
+**Appending missing contacts:**
+
+- `--add-missing` (flag): append high-frequency pairs from `missing_high_freq.itp` into the final `go_nbparams.itp`. The script includes the `[ nonbond_params ]` header on append, and no extra blank line is added. Distances for these pairs are average CA–CA over all frames (in nm), and only pairs with average ≤ `--go-up` are kept.
+
+Run `python contact_analysis.py -h` to view all flags with their default values.
+
+---
+
+## How distances are computed (nm)
+
+When building `missing_high_freq.itp`, the script scans all frames and measures CA–CA distances for each missing high-frequency contact.
+
+- PDB frames: MDAnalysis positions are in angstroms. They are converted to nm by dividing by 10.
+- CIF frames: a lightweight mmCIF reader provides angstrom coordinates, then the script converts to nm by dividing by 10.
+
+It then averages per-pair distances across all frames (nm) and keeps the pair only if `average_distance ≤ --go-up`.
+
+The Lennard-Jones minimum used in the ITP is:
+
+```ini
+rmin = avg / 2^(1/6)
+epsilon = --go-eps  # kJ/mol
+```
+
+---
+
+## Output
+
+- `filtered_*.txt`, `annotated_*.txt`: per-frame filtered and annotated contacts
+- `normalized_<type>.txt`: contact frequencies across frames
+- `high_<type>.txt`: contacts with frequency ≥ threshold
+- `best_frame.txt` (plus a ties file if needed)
+- `topol.top`, `<frame>_CG.pdb`
+- `go_nbparams.itp` (filtered as requested)
+- `go_nbparams_mock_<type>.itp` (mock for bookkeeping)
+- `missing_high_freq.itp` (optional source for `--add-missing`)
+- `high_counts_per_frame.txt`, `go_counts_per_frame.txt`
+
+All intermediate `.txt`, `.map`, and input frames are moved to `output_files/`.
+The final CG PDB stays in the run directory.
+
+---
+
+## Notes and tips
+
+- For single proteins (monomers) use `--type intra`.
+- For complexes, use `--type inter` or `--type both`:
+  - `inter`: keeps all intra pairs plus only high-frequency inter pairs
+  - `intra`: keeps all intra pairs plus only high-frequency intra pairs
+  - `both`: keeps only high-frequency pairs (intra and inter)
+- The script feeds `martinize2` with `-go <frame_X.map>` corresponding to the same frame used by `-f` (PDB or CIF).
+- If you see an MDAnalysis warning about missing element information, it is harmless for distance calculations.
+
+---
+
+## Reproducibility
+
+The script logs the exact command line into `run.log` each time you run it.
+
+---
+
+## Citation
+
+If you use these tools, please cite the Gō-Martini and MARTINI references, and the contact_map generator repository linked above.
