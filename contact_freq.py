@@ -158,8 +158,7 @@ def get_cif_ca_coords(path: str) -> Dict[Tuple[str, str], np.ndarray]:
 def process_contact_map(args):
     in_file, cm_dir = args
     exe = os.path.join(cm_dir, "contact_map")
-    base, _ = os.path.splitext(in_file)
-    out_map = f"{base}.map"
+    out_map = f"{os.path.splitext(in_file)[0]}.map"
     subprocess.run([exe, in_file],
                    stdout=open(out_map, "w"),
                    stderr=subprocess.DEVNULL)
@@ -646,6 +645,10 @@ def main():
     parser.add_argument("--force-frame", type=int, default=None,
                         help="Use this specific frame index for martinize2")
 
+    # NEW FLAG: sigma recalculation
+    parser.add_argument("--sigma", dest="sigma", action="store_true",
+                        help="Recalculate sigma values from selected frame and replace them in go_nbparams.itp")
+
     args = parser.parse_args()
 
     # discover frames
@@ -848,28 +851,91 @@ def main():
                 wf.write(line)
                 continue
 
-            idx_pair = (min(i1, i2), max(i1, i2))
+            pair_key = (min(i1, i2), max(i1, i2))
+            c1 = inv_map_inv.get(i1)
+            c2 = inv_map_inv.get(i2)
+            same_chain = (c1 is not None and c2 is not None and c1 == c2)
 
-            # chain labeling from atomistic mapping
-            same_chain = (inv_map_inv.get(i1) == inv_map_inv.get(i2))
-
-            # filtering policy:
-            # inter  -> keep all intra, and only high-frequency inter
-            # intra  -> keep all intra, and only high-frequency inter
-            # both   -> keep only high-frequency (intra and inter)
-            if args.type == "inter":
-                keep = same_chain or ((not same_chain) and (idx_pair in high_pairs))
+            # keep only high-frequency pairs, restricted by type when applicable
+            if args.type == "both":
+                keep = (pair_key in high_pairs)
             elif args.type == "intra":
-                keep = same_chain or (idx_pair in high_pairs)
-            else:  # both
-                keep = (idx_pair in high_pairs)
+                keep = (pair_key in high_pairs) and same_chain
+            else:  # inter
+                keep = (pair_key in high_pairs) and (c1 is not None and c2 is not None and c1 != c2)
 
             if keep:
                 wf.write(line)
 
     print("ITP filtering done:",
-          f"type={args.type}, high_pairs={len(high_pairs)}",
+          f"type={args.type}, kept_high_pairs={len(load_itp('go_nbparams.itp'))}, high_pairs_total={len(high_pairs)}",
           flush=True)
+
+    # --- optional sigma recalculation from selected frame ---
+    if getattr(args, "sigma", False):
+        print("Recalculating sigma values from selected frame distances...", flush=True)
+
+        # Load the selected structure
+        u = mda.Universe(atom_path)
+
+        # Collect current pairs from the filtered go_nbparams.itp
+        pairs = []
+        for line in open("go_nbparams.itp"):
+            if line.startswith("molecule_0_"):
+                a, b = line.split()[:2]
+                try:
+                    i1 = int(a.rsplit("_", 1)[1])
+                    i2 = int(b.rsplit("_", 1)[1])
+                    pairs.append((i1, i2))
+                except Exception:
+                    continue
+
+        # Measure distances on the selected frame and compute sigma = distance / 2^(1/6)
+        dist_data = {}
+        for i1, i2 in tqdm(pairs, desc="Computing sigma from frame"):
+            (r1, c1) = inv_rev_full.get(i1, (None, None))
+            (r2, c2) = inv_rev_full.get(i2, (None, None))
+            if not all([r1, r2, c1, c2]):
+                continue
+            sel1 = u.select_atoms(f"segid {c1} and resid {r1} and name CA")
+            sel2 = u.select_atoms(f"segid {c2} and resid {r2} and name CA")
+            if sel1.n_atoms > 0 and sel2.n_atoms > 0:
+                d_nm = distance_array(sel1.positions, sel2.positions)[0, 0] / 10.0
+                sigma = d_nm / (2 ** (1 / 6))
+                dist_data[(min(i1, i2), max(i1, i2))] = sigma
+
+        # Rewrite go_nbparams.itp replacing only sigma values
+        tmp_out = "go_nbparams_sigma.itp"
+        with open("go_nbparams.itp", "r") as rf, open(tmp_out, "w") as wf:
+            for line in rf:
+                if line.startswith("molecule_0_"):
+                    parts = line.split()
+                    if len(parts) < 5:
+                        wf.write(line)
+                        continue
+                    a, b = parts[:2]
+                    try:
+                        i1 = int(a.rsplit("_", 1)[1])
+                        i2 = int(b.rsplit("_", 1)[1])
+                    except Exception:
+                        wf.write(line)
+                        continue
+                    pkey = (min(i1, i2), max(i1, i2))
+                    sigma = dist_data.get(pkey)
+                    if sigma is not None:
+                        # keep epsilon from the line if it exists, otherwise fallback to args.go_eps
+                        try:
+                            eps = float(parts[4])
+                        except Exception:
+                            eps = args.go_eps
+                        wf.write(f"{a} {b} 1 {sigma:.8f} {eps:.8f} ; sigma from frame {frame_idx}\n")
+                    else:
+                        wf.write(line)
+                else:
+                    wf.write(line)
+
+        shutil.move(tmp_out, "go_nbparams.itp")
+        print("Sigma recalculation complete.", flush=True)
 
     # measure distances for missing high-frequency pairs and write a separate ITP
     mock_pairs = load_itp(mock_itp)
@@ -903,7 +969,7 @@ def main():
             for r1, c1, r2, c2 in missing_info:
                 sel1 = u.select_atoms(f"segid {c1} and resid {r1} and name CA")
                 sel2 = u.select_atoms(f"segid {c2} and resid {r2} and name CA")
-                if sel1 and sel2:
+                if sel1.n_atoms > 0 and sel2.n_atoms > 0:
                     d_nm = distance_array(sel1.positions, sel2.positions)[0, 0] / 10.0  # A -> nm
                     dist_dict[(r1, c1, r2, c2)].append(d_nm)
         else:
@@ -971,4 +1037,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
