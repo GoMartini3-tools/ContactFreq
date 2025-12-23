@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# updated: 24-09-2025
+# updated: 23-12-2025
 """
 Comprehensive contact analysis pipeline including martinize2.
 
@@ -382,7 +382,11 @@ def run_martinize_from_atom(atom_path,
                             write_repair,
                             write_canon,
                             vcount,
-                            maxwarn_list):
+                            maxwarn_list,
+                            to_ff=None,
+                            extra_ff_dir=None,
+                            extra_map_dir=None
+):
     atom = atom_path
     base = os.path.splitext(os.path.basename(atom))[0]
     atom_dir = os.path.dirname(atom) or "."
@@ -396,6 +400,20 @@ def run_martinize_from_atom(atom_path,
         cmd += ["-dssp", dssp]
     if ss:
         cmd += ["-ss", ss]
+        
+    # force field selection
+    if to_ff:
+        cmd += ["-ff", to_ff]
+
+    # additional ff dirs
+    if extra_ff_dir:
+        for d in extra_ff_dir:
+            cmd += ["-ff-dir", d]
+
+    # additional map dirs
+    if extra_map_dir:
+        for d in extra_map_dir:
+            cmd += ["-map-dir", d]    
 
     # Go model from external map file plus tunables
     cmd += ["-go", go_map_path, "-go-eps", str(goeps)]
@@ -460,12 +478,13 @@ def run_martinize_from_atom(atom_path,
         "-o", "topol.top",
         "-x", cg,
         "-p", posres,
-        "-ff", "martini3001",
         "-cys", "auto" if cys is None else cys,
         "-ignh",
-        "-from", src,
         "-name", "molecule_0",
     ]
+    if src is not None:
+        cmd += ["-from", src]
+        
     if maxwarn_list:
         cmd += ["-maxwarn", *[str(x) for x in maxwarn_list]]
     else:
@@ -595,6 +614,16 @@ def main():
                         help="Backbone bead name for Go site")
     parser.add_argument("--go-atomname", dest="go_atomname", type=str, default="CA",
                         help="Virtual Go site atom name")
+                        
+    parser.add_argument("--ff", dest="to_ff", default="martini3001",
+                    help="Coarse-grained force field for martinize2")
+
+    parser.add_argument("--ff-dir", dest="extra_ff_dir", nargs="+", default=None,
+                    help="Additional repository paths for custom force fields")
+
+    parser.add_argument("--map-dir", dest="extra_map_dir", nargs="+", default=None,
+                    help="Additional repository paths for mapping files")
+
 
     # Water bias options
     parser.add_argument("--water-bias", dest="water_bias", action="store_true",
@@ -626,7 +655,7 @@ def main():
                         help="Set neutral termini")
 
     # source force field
-    parser.add_argument("--from", dest="md_source", choices=["amber","charmm"], default="amber",
+    parser.add_argument("--from", dest="md_source", choices=["amber","charmm"], default=None,
                         help="Source force field for martinize2")
 
     # Debugging / diagnostics passthrough
@@ -787,7 +816,10 @@ def main():
         write_repair=args.write_repair,
         write_canon=args.write_canon,
         vcount=args.vcount,
-        maxwarn_list=args.maxwarn_list
+        maxwarn_list=args.maxwarn_list,
+        to_ff=args.to_ff,
+        extra_ff_dir=args.extra_ff_dir,
+        extra_map_dir=args.extra_map_dir
     )
 
     # build index and reverse map
@@ -856,16 +888,30 @@ def main():
             c2 = inv_map_inv.get(i2)
             same_chain = (c1 is not None and c2 is not None and c1 == c2)
 
-            # keep only high-frequency pairs, restricted by type when applicable
+            # decide which Go contacts to keep depending on type
             if args.type == "both":
+                # keep only high-frequency (intra and inter)
                 keep = (pair_key in high_pairs)
+
             elif args.type == "intra":
-                keep = (pair_key in high_pairs) and same_chain
-            else:  # inter
-                keep = (pair_key in high_pairs) and (c1 is not None and c2 is not None and c1 != c2)
+                if same_chain:
+                    # for intra contacts: keep only high-frequency intra
+                    keep = (pair_key in high_pairs)
+                else:
+                    # for inter contacts: do not touch them, always keep
+                    keep = True
+
+            else:  # args.type == "inter"
+                if same_chain:
+                    # for intra contacts: do not touch them, always keep
+                    keep = True
+                else:
+                    # for inter contacts: keep only high-frequency inter
+                    keep = (pair_key in high_pairs)
 
             if keep:
                 wf.write(line)
+        # if not keep: drop this Go pair
 
     print("ITP filtering done:",
           f"type={args.type}, kept_high_pairs={len(load_itp('go_nbparams.itp'))}, high_pairs_total={len(high_pairs)}",
