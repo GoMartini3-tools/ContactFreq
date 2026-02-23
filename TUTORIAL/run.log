@@ -1,0 +1,6 @@
+[2026-02-16 18:10:17] Command: contact_freq.py --cm /path/to/contact_map_binary --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
+[2026-02-16 18:11:59] Command: contact_freq.py --cm ./contact_map --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
+[2026-02-16 18:12:31] Command: contact_freq.py --cm ./contact_map --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
+[2026-02-16 18:12:39] Command: contact_freq.py --cm contact_map --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
+[2026-02-16 18:12:58] Command: contact_freq.py --cm ./contact_map --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
+[2026-02-16 18:13:11] Command: contact_freq.py --cm ./ --type both --cpus 15 --threshold 0.7 --merge all --dssp mkdssp --go-eps 15 --from amber
