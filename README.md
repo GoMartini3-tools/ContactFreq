@@ -179,4 +179,8 @@ The script logs the exact command line into `run.log` each time you run it.
 
 ## Citation
 
-If you use these tools, please cite the Gō-Martini and MARTINI references, and the contact_map generator repository linked above.
+If you use this repository, please cite:
+
+1. Cofas-Vargas, L. F., Olivos-Ramirez, G. E., Chwastyk, M., Moreira, R. A., Baker, J. L., Marrink, S. J., & Poma, A. B. (2024). Nanomechanical footprint of SARS-CoV-2 variants in complex with a potent nanobody by molecular simulations. *Nanoscale, 16*(40), 18824–18834. https://doi.org/10.1039/D4NR02074J
+
+2. Olivos-Ramirez, G. E., Cofas-Vargas, L. F., Marrink, S. J., & Poma, A. B. (2025). An optimized contact map for GōMartini 3 enabling conformational changes in protein assemblies [Preprint]. *bioRxiv*. https://doi.org/10.1101/2025.11.14.688437
