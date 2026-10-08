@@ -19,13 +19,15 @@ This script performs the following steps:
  10. Move final .txt, .map and frame files into an output_files folder
 
 Usage:
-  python contact_analysis.py [options]
+  python contact_calculation.py [options]
   e.g. python contact_calculation.py --type both --merge all --dssp mkdssp --go-eps 15 --from charmm --cm /home/phoenix/software/
 
-Run `python contact_analysis.py -h` to see all available flags.
+Run `python contact_calculation.py -h` to see all available flags.
 """
 
 import os
+import sys
+import shlex
 import glob
 import shutil
 import re
@@ -43,6 +45,9 @@ import warnings
 warnings.filterwarnings("ignore",
                         category=UserWarning,
                         module="MDAnalysis.topology.PDBParser")
+
+# Prefix used by martinize2 (-name) for the Go virtual sites: <MOLNAME>_<bead index>
+MOLNAME = "molecule_0"
 
 # ---------------- frame discovery ----------------
 
@@ -158,20 +163,32 @@ def get_cif_ca_coords(path: str) -> Dict[Tuple[str, str], np.ndarray]:
 def process_contact_map(args):
     in_file, cm_dir = args
     exe = os.path.join(cm_dir, "contact_map")
-    out_map = f"{os.path.splitext(in_file)[0]}.map"
-    subprocess.run([exe, in_file],
-                   stdout=open(out_map, "w"),
-                   stderr=subprocess.DEVNULL)
+    base, _ = os.path.splitext(in_file)
+    out_map = f"{base}.map"
+    with open(out_map, "w") as fh:
+        res = subprocess.run([exe, in_file], stdout=fh,
+                             stderr=subprocess.PIPE, text=True)
+    return in_file, res.returncode, (res.stderr or "").strip()[-300:]
 
 def run_contact_map(frames, cm_dir, cpus):
+    exe = os.path.join(cm_dir, "contact_map")
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        raise FileNotFoundError(f"contact_map executable not found or not executable: {exe} (use --cm)")
+    failed = []
     with Pool(cpus) as pool:
-        for _ in tqdm(pool.imap_unordered(
-                        process_contact_map,
-                        [(p, cm_dir) for p in frames]
-                    ),
-                      total=len(frames),
-                      desc="Mapping"):
-            pass
+        for in_file, rc, err in tqdm(pool.imap_unordered(
+                                         process_contact_map,
+                                         [(p, cm_dir) for p in frames]),
+                                     total=len(frames),
+                                     desc="Mapping"):
+            if rc != 0:
+                failed.append((in_file, rc, err))
+    for in_file, rc, err in failed[:10]:
+        print(f"WARNING: contact_map exited with code {rc} on {in_file}: {err}")
+    if failed:
+        print(f"WARNING: contact_map reported errors on {len(failed)} of {len(frames)} frames")
+        if all(os.path.getsize(os.path.splitext(p)[0] + ".map") == 0 for p in frames):
+            raise RuntimeError("contact_map produced empty maps for every frame; check --cm and the inputs")
 
 def clean_maps(src, backup, header_regex):
     """
@@ -193,7 +210,7 @@ def clean_maps(src, backup, header_regex):
                     if "UNMAPPED" not in line:
                         out.write(line)
 
-def filter_map(map_file, low_nm, up_nm, out_txt):
+def filter_map(map_file, low_nm, up_nm, out_txt, min_seq_sep=4):
     """
     Keep contacts with distance between low_nm and up_nm inclusive.
     Map distances are in angstroms, so thresholds in nm are converted to angstroms.
@@ -215,7 +232,7 @@ def filter_map(map_file, low_nm, up_nm, out_txt):
                 r2, c2 = parts[7], parts[8]
             except (IndexError, ValueError):
                 continue
-            if (abs(i2 - i1) >= 4 and
+            if ((c1 != c2 or abs(i2 - i1) >= min_seq_sep) and
                 low_a <= dist_a <= up_a and
                 (ov.search(flags) or rz.search(flags))):
                 out.write(f"{r1}\t{c1}\t{i1}\t{r2}\t{c2}\t{i2}\t{dist_a:.4f}\t{flags}\n")
@@ -237,41 +254,57 @@ def annotate(inp, outp, keep_same, keep_diff):
                     rel = ("same_chain" if ch1 == ch2 else "different_chains")
                     out.write(line.strip() + f"\t{rel}\n")
 
+def _num(x):
+    try:
+        return (0, int(x))
+    except ValueError:
+        return (1, x)
+
 def analyze_frequency(pattern, out_norm, out_high, thr):
     """
     Build per-pair frequency over all annotated_* files.
 
-    The normalized/high files have columns:
-      Res1  Res2  Freq  Chain1  Chain2  Resname1  Resname2
-    where Res1 and Res2 are i1 and i2 from the annotated lines,
-    Chain1 and Chain2 are c1 and c2, and Resname1/2 are r1 and r2.
+    Pairs are keyed by an orientation independent (resid, chain, resid, chain)
+    tuple, so the same contact is counted once regardless of the order in which
+    contact_map reported it, and residue names (which may vary between frames,
+    e.g. HIS/HID/HIE) are not part of the key. The threshold is applied to the
+    exact fraction, not to the rounded value written to disk.
+
+    Output columns: Res1 Res2 Freq Chain1 Chain2 Resname1 Resname2
     """
     counts = defaultdict(int)
-    records = []
-    for fn in glob.glob(pattern):
-        lines = open(fn).read().splitlines()
-        records.append([l for l in lines if l and not l.startswith("Res1")])
-    total = len(records) if records else 1
-    for rec in records:
-        for l in rec:
-            c = l.split()
-            if len(c) < 6:
-                continue
-            key = (c[2], c[5], c[1], c[4], c[0], c[3])  # (i1, i2, c1, c2, r1, r2)
-            counts[key] += 1
+    names = {}
+    files = sorted(glob.glob(pattern))
+    for fn in files:
+        seen = set()
+        with open(fn) as fh:
+            for l in fh:
+                c = l.split()
+                if len(c) < 6 or c[0] == "Res1":
+                    continue
+                a = (c[2], c[1], c[5], c[4])
+                b = (c[5], c[4], c[2], c[1])
+                key = a if a <= b else b
+                if key in seen:
+                    continue
+                seen.add(key)
+                counts[key] += 1
+                if key not in names:
+                    names[key] = (c[0], c[3]) if key == a else (c[3], c[0])
+    total = len(files) or 1
 
-    with open(out_norm, "w") as out:
-        out.write("Res1\tRes2\tFreq\tChain1\tChain2\tResname1\tResname2\n")
-        for k, v in counts.items():
-            i1, i2, c1, c2, r1, r2 = k
-            out.write(f"{i1}\t{i2}\t{v/total:.2f}\t{c1}\t{c2}\t{r1}\t{r2}\n")
-
-    with open(out_high, "w") as out:
-        header = open(out_norm).readline()
+    header = "Res1\tRes2\tFreq\tChain1\tChain2\tResname1\tResname2\n"
+    order = sorted(counts, key=lambda k: (k[1], _num(k[0]), k[3], _num(k[2])))
+    with open(out_norm, "w") as out, open(out_high, "w") as hi:
         out.write(header)
-        for l in open(out_norm).read().splitlines()[1:]:
-            if float(l.split()[2]) >= thr:
-                out.write(l + "\n")
+        hi.write(header)
+        for k in order:
+            v = counts[k]
+            r1, r2 = names[k]
+            line = f"{k[0]}\t{k[2]}\t{v/total:.2f}\t{k[1]}\t{k[3]}\t{r1}\t{r2}\n"
+            out.write(line)
+            if v / total >= thr - 1e-9:
+                hi.write(line)
 
 # ---------------- helpers for keys and per-frame counting ----------------
 
@@ -313,7 +346,7 @@ def write_counts_per_frame(ref_pairs, annotated_pattern, out_path, label="RefSet
 def go_pairs_as_resid_chain(itp_path, inv_rev):
     ref = set()
     for line in open(itp_path):
-        if not line.startswith("molecule_0_"):
+        if not line.startswith(MOLNAME + "_"):
             continue
         a, b = line.split()[:2]
         i1 = int(a.rsplit("_", 1)[1])
@@ -385,8 +418,11 @@ def run_martinize_from_atom(atom_path,
                             maxwarn_list,
                             to_ff=None,
                             extra_ff_dir=None,
-                            extra_map_dir=None
-):
+                            extra_map_dir=None,
+                            ignore=None,
+                            model=None,
+                            posres_fc=None,
+                            extra_args=None):
     atom = atom_path
     base = os.path.splitext(os.path.basename(atom))[0]
     atom_dir = os.path.dirname(atom) or "."
@@ -394,10 +430,11 @@ def run_martinize_from_atom(atom_path,
 
     cmd = ["martinize2", "-f", atom]
 
-    if merge:
-        cmd += ["-merge", merge]
-    if dssp:
-        cmd += ["-dssp", dssp]
+    for grp in (merge or []):
+        cmd += ["-merge", grp]
+    if dssp is not None:
+        # empty string means: flag without executable (martinize2 falls back to mdtraj)
+        cmd += ["-dssp"] + ([dssp] if dssp else [])
     if ss:
         cmd += ["-ss", ss]
         
@@ -448,8 +485,6 @@ def run_martinize_from_atom(atom_path,
         cmd += ["-noscfix"]
     if scfix:
         cmd += ["-scfix"]
-    if cys is not None:
-        cmd += ["-cys", cys]
     if mutate:
         cmd += ["-mutate", *mutate]
     if modify:
@@ -473,6 +508,16 @@ def run_martinize_from_atom(atom_path,
     if vcount and vcount > 0:
         cmd += ["-v"] * vcount
 
+    # input selection, custom force fields, restraints, passthrough
+    if ignore:
+        cmd += ["-ignore", *ignore]
+    if model is not None:
+        cmd += ["-model", str(model)]
+    if posres_fc is not None:
+        cmd += ["-pf", str(posres_fc)]
+    if extra_args:
+        cmd += list(extra_args)
+
     # core output and settings
     cmd += [
         "-o", "topol.top",
@@ -480,7 +525,7 @@ def run_martinize_from_atom(atom_path,
         "-p", posres,
         "-cys", "auto" if cys is None else cys,
         "-ignh",
-        "-name", "molecule_0",
+        "-name", MOLNAME,
     ]
     if src is not None:
         cmd += ["-from", src]
@@ -541,18 +586,19 @@ def build_index(struct_path: str):
 def load_itp(path):
     s = set()
     for line in open(path):
-        if line.startswith("molecule_0_"):
+        if line.startswith(MOLNAME + "_"):
             a, b = line.split()[:2]
             i, j = map(int, [a.rsplit("_", 1)[1], b.rsplit("_", 1)[1]])
             s.add((min(i, j), max(i, j)))
     return s
 
-def write_mock(highfile, struct_path, itp_out):
+def write_mock(highfile, struct_path, itp_out, inv=None):
     """
     Write a mock Go ITP using residue indices (i1, i2) and chain IDs (c1, c2).
     Works for PDB or CIF, using build_index.
     """
-    inv = build_index(struct_path)  # keys: (str(resid), chain) -> sequential bead index
+    if inv is None:
+        inv = build_index(struct_path)  # keys: (str(resid), chain) -> sequential bead index
     with open(itp_out, "w") as out:
         out.write("[ nonbond_params ]\n")
         with open(highfile) as hf:
@@ -566,17 +612,41 @@ def write_mock(highfile, struct_path, itp_out):
                 i1 = inv.get((resid1, ch1))
                 i2 = inv.get((resid2, ch2))
                 if i1 and i2:
-                    out.write(f"molecule_0_{i1} molecule_0_{i2} 1 0.00000000 0.00000000 ; mock\n")
+                    out.write(f"{MOLNAME}_{i1} {MOLNAME}_{i2} 1 0.00000000 0.00000000 ; mock\n")
+
+# ---------------- distance measurement for missing contacts ----------------
+
+def ca_table_pdb(path):
+    """Return {(resid_str, chain): (x, y, z)} for CA atoms of the first model, in angstroms."""
+    t = {}
+    with open(path) as fh:
+        for l in fh:
+            if l.startswith("ENDMDL"):
+                break
+            if l.startswith(("ATOM", "HETATM")) and l[12:16].strip() == "CA":
+                try:
+                    key = (str(int(l[22:26])), l[21])
+                    xyz = (float(l[30:38]), float(l[38:46]), float(l[46:54]))
+                except ValueError:
+                    continue
+                t.setdefault(key, xyz)  # keep first altloc
+    return t
+
+def _missing_distances(task):
+    """Worker: distances (nm) for the requested pairs present in one frame."""
+    path, keys1, keys2 = task
+    coords = get_cif_ca_coords(path) if path.lower().endswith(".cif") else ca_table_pdb(path)
+    idx, dist = [], []
+    for k, (k1, k2) in enumerate(zip(keys1, keys2)):
+        p1, p2 = coords.get(k1), coords.get(k2)
+        if p1 is not None and p2 is not None:
+            idx.append(k)
+            dist.append(float(np.linalg.norm(np.asarray(p1, dtype=float) - np.asarray(p2, dtype=float))) / 10.0)
+    return np.array(idx, dtype=int), np.array(dist, dtype=float)
 
 # ---------------- main ----------------
 
 def main():
-    import sys
-
-    # Log the command used to run the script
-    with open("run.log", "a") as log_file:
-        log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Command: {' '.join(sys.argv)}\n")
-
     parser = argparse.ArgumentParser(
         description="Run full contact analysis and build coarse-grained model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -588,10 +658,12 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.7, help="Frequency threshold for high-frequency contacts")
 
     # martinize2 related arguments
-    parser.add_argument("--merge", type=str, default=None, help="Chains to merge or 'all'")
+    parser.add_argument("--merge", action="append", default=None,
+                        help="Chains to merge (e.g. A,B) or 'all'; may be repeated for several groups")
 
     # optional DSSP
-    parser.add_argument("--dssp", dest="dssp_path", default=None, help="Path to dssp executable")
+    parser.add_argument("--dssp", dest="dssp_path", nargs="?", const="", default=None,
+                        help="Optional. Path to dssp executable; give --dssp without a value to let martinize2 use mdtraj")
 
     # position restraints
     parser.add_argument("--posres", choices=["none", "all", "backbone"], default="none",
@@ -666,6 +738,18 @@ def main():
     parser.add_argument("--maxwarn", dest="maxwarn_list", nargs="+", default=None,
                         help="Maximum allowed warnings for Martinize2")
 
+    # Additional martinize2 passthrough and script-level options
+    parser.add_argument("--ignore", dest="ignore", nargs="+", default=None,
+                        help="Residue names martinize2 should ignore, e.g. HOH LIG")
+    parser.add_argument("--model", type=int, default=None, help="MODEL number to read (multi-model PDB)")
+    parser.add_argument("--posres-fc", dest="posres_fc", type=float, default=None,
+                        help="Position restraint force constant in kJ/mol/nm^2 (martinize2 -pf)")
+    parser.add_argument("--min-seq-sep", dest="min_seq_sep", type=int, default=4,
+                        help="Minimum residue separation for intra-chain contacts in the frequency analysis "
+                             "(not equivalent to martinize2 --go-res-dist, which is a graph distance)")
+    parser.add_argument("--martinize-extra", dest="martinize_extra", default="",
+                        help='Extra martinize2 flags as one string, use the = form, e.g. --martinize-extra="-bonds-fudge 1.4"')
+
     # Append missing high-frequency contacts
     parser.add_argument("--add-missing", dest="add_missing", action="store_true",
                         help="Append entries from missing_high_freq.itp into go_nbparams.itp to include all high-frequency contacts")
@@ -680,6 +764,23 @@ def main():
 
     args = parser.parse_args()
 
+    if args.dssp_path is not None and args.ss:
+        parser.error("--dssp and --ss are mutually exclusive")
+
+    # Log the command used to run the script
+    with open("run.log", "a") as log_file:
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_file.write(f"[{stamp}] Command: {' '.join(sys.argv)}\n")
+        try:
+            ver = subprocess.run(["martinize2", "-V"], capture_output=True, text=True, timeout=60)
+            log_file.write(f"[{stamp}] martinize2 version: {(ver.stdout or ver.stderr).strip()}\n")
+        except (OSError, subprocess.SubprocessError):
+            log_file.write(f"[{stamp}] martinize2 version: unavailable\n")
+
+    if args.dssp_path is None and not args.ss:
+        print("NOTE: neither --dssp nor --ss given; martinize2 will build the topology without "
+              "secondary structure information (warning suppressed by --maxwarn).", flush=True)
+
     # discover frames
     frames_map = list_frames()
     if not frames_map:
@@ -687,14 +788,14 @@ def main():
     frames = [frames_map[i] for i in sorted(frames_map.keys())]
 
     # optional merge all chains
-    if args.merge == "all" and frames:
+    if args.merge == ["all"] and frames:
         first = frames[0]
         if first.lower().endswith(".pdb"):
             uni = mda.Universe(first)
             chains = sorted({(seg.segid or "").strip() for seg in uni.segments if (seg.segid or "").strip()})
         else:
             chains = get_cif_chains(first)
-        args.merge = ",".join(chains)
+        args.merge = [",".join(chains)] if chains else None
 
     # run external contact mapper and clean maps
     run_contact_map(frames, args.cm, args.cpus)
@@ -705,7 +806,7 @@ def main():
     for mfile in glob.glob("*.map"):
         base, _ = os.path.splitext(mfile)
         out_txt = f"filtered_{os.path.basename(base)}.txt"
-        filter_map(mfile, args.go_low, args.go_up, out_txt)
+        filter_map(mfile, args.go_low, args.go_up, out_txt, args.min_seq_sep)
         filtered.append(out_txt)
 
     for f in filtered:
@@ -819,7 +920,11 @@ def main():
         maxwarn_list=args.maxwarn_list,
         to_ff=args.to_ff,
         extra_ff_dir=args.extra_ff_dir,
-        extra_map_dir=args.extra_map_dir
+        extra_map_dir=args.extra_map_dir,
+        ignore=args.ignore,
+        model=args.model,
+        posres_fc=args.posres_fc,
+        extra_args=shlex.split(args.martinize_extra)
     )
 
     # build index and reverse map
@@ -830,7 +935,7 @@ def main():
     # collect high-frequency pairs mapped into sequential bead indices
     high_pairs = set()
     with open(high_file) as hf:
-        next(hf)
+        next(hf, None)
         for line in hf:
             p = line.split()
             if len(p) < 5:
@@ -844,7 +949,7 @@ def main():
 
     # write mock using residue indices and chains
     mock_itp = f"go_nbparams_mock_{args.type}.itp"
-    write_mock(high_file, atom_path, mock_itp)
+    write_mock(high_file, atom_path, mock_itp, inv_map)
 
     # --- rewrite go_nbparams.itp with proper header and filtering ---
     src_itp = "go_nbparams.itp"
@@ -870,7 +975,7 @@ def main():
                 continue
 
             # process only pair lines; pass through anything else
-            if not ls.startswith("molecule_0_"):
+            if not ls.startswith(MOLNAME + "_"):
                 wf.write(line)
                 continue
 
@@ -927,7 +1032,7 @@ def main():
         # Collect current pairs from the filtered go_nbparams.itp
         pairs = []
         for line in open("go_nbparams.itp"):
-            if line.startswith("molecule_0_"):
+            if line.startswith(MOLNAME + "_"):
                 a, b = line.split()[:2]
                 try:
                     i1 = int(a.rsplit("_", 1)[1])
@@ -954,7 +1059,7 @@ def main():
         tmp_out = "go_nbparams_sigma.itp"
         with open("go_nbparams.itp", "r") as rf, open(tmp_out, "w") as wf:
             for line in rf:
-                if line.startswith("molecule_0_"):
+                if line.startswith(MOLNAME + "_"):
                     parts = line.split()
                     if len(parts) < 5:
                         wf.write(line)
@@ -990,6 +1095,7 @@ def main():
 
     # prepare mapping info for missing
     missing_info = []
+    seen_missing = set()
     with open(high_file) as hf:
         next(hf, None)
         for line in hf:
@@ -1000,44 +1106,40 @@ def main():
             ch1, ch2 = p[3], p[4]
             i1 = inv_map.get((r1_resid, ch1))
             i2 = inv_map.get((r2_resid, ch2))
-            if i1 and i2 and (min(i1, i2), max(i1, i2)) in missing:
+            if i1 and i2 and (min(i1, i2), max(i1, i2)) in missing \
+                    and (min(i1, i2), max(i1, i2)) not in seen_missing:
+                seen_missing.add((min(i1, i2), max(i1, i2)))
                 missing_info.append((r1_resid, ch1, r2_resid, ch2))
 
-    # collect all frame files for distance measurement (PDB and CIF)
-    frame_files = sorted(set(glob.glob("frame_*.pdb") + glob.glob("frame_*.cif")))
+    # frames already deduplicated by index (PDB preferred); excludes *_CG.pdb outputs
+    frame_files = list(frames)
 
     # distances are accumulated in nanometers to match Martinize2 Go parameters
-    dist_dict = {mi: [] for mi in missing_info}
-    for fpath in tqdm(frame_files, desc="Measuring missing distances"):
-        if fpath.lower().endswith(".pdb"):
-            u = mda.Universe(fpath)
-            u.guess_TopologyAttrs(to_guess=["elements"])  # optional; no impact on distances
-            for r1, c1, r2, c2 in missing_info:
-                sel1 = u.select_atoms(f"segid {c1} and resid {r1} and name CA")
-                sel2 = u.select_atoms(f"segid {c2} and resid {r2} and name CA")
-                if sel1.n_atoms > 0 and sel2.n_atoms > 0:
-                    d_nm = distance_array(sel1.positions, sel2.positions)[0, 0] / 10.0  # A -> nm
-                    dist_dict[(r1, c1, r2, c2)].append(d_nm)
-        else:
-            coords = get_cif_ca_coords(fpath)  # angstroms
-            for r1, c1, r2, c2 in missing_info:
-                k1 = (r1, c1); k2 = (r2, c2)
-                if k1 in coords and k2 in coords:
-                    d_ang = np.linalg.norm(coords[k1] - coords[k2])
-                    dist_dict[(r1, c1, r2, c2)].append(d_ang / 10.0)  # nm
+    dist_avg = {}
+    if missing_info:
+        keys1 = [(r1, c1) for r1, c1, _, _ in missing_info]
+        keys2 = [(r2, c2) for _, _, r2, c2 in missing_info]
+        dist_sum = np.zeros(len(missing_info))
+        dist_n = np.zeros(len(missing_info), dtype=int)
+        with Pool(args.cpus) as pool:
+            for idx, d_nm in tqdm(pool.imap(_missing_distances,
+                                            [(f, keys1, keys2) for f in frame_files]),
+                                  total=len(frame_files),
+                                  desc="Measuring missing distances"):
+                dist_sum[idx] += d_nm
+                dist_n[idx] += 1
+        dist_avg = {mi: dist_sum[k] / dist_n[k]
+                    for k, mi in enumerate(missing_info) if dist_n[k] > 0}
 
     missing_itp = "missing_high_freq.itp"
     with open(missing_itp, "w") as wf:
         wf.write("; missing high-frequency contacts\n")
-        for (r1, c1, r2, c2), ds in dist_dict.items():
-            if not ds:
-                continue
-            avg = np.mean(ds)                 # nm
+        for (r1, c1, r2, c2), avg in dist_avg.items():   # avg in nm
             if avg > args.go_up:  # keep only if within the go_up threshold (nm)
                 continue
             rmin = avg / (2 ** (1 / 6))       # nm, Lennard-Jones minimum
             i1, i2 = inv_map[(r1, c1)], inv_map[(r2, c2)]
-            wf.write(f"molecule_0_{i1} molecule_0_{i2} 1 {rmin:.8f} {args.go_eps:.8f} ; go bond {avg:.4f}\n")
+            wf.write(f"{MOLNAME}_{i1} {MOLNAME}_{i2} 1 {rmin:.8f} {args.go_eps:.8f} ; go bond {avg:.4f}\n")
 
     # optionally append missing high-frequency contacts into the selected ITP
     if args.add_missing and os.path.isfile(missing_itp):
@@ -1046,7 +1148,7 @@ def main():
                 ls = ln.strip()
                 if not ls:
                     continue
-                if ls.startswith(";") or ls.startswith("molecule_0_"):
+                if ls.startswith(";") or ls.startswith(MOLNAME + "_"):
                     out.write(ln)
         print("Appended missing high-frequency contacts into go_nbparams.itp", flush=True)
 
@@ -1068,8 +1170,9 @@ def main():
     outdir = "output_files"
     os.makedirs(outdir, exist_ok=True)
 
-    for ext in ("*.txt", "*.map"):
-        for fn in glob.glob(ext):
+    for pat in ("filtered_*.txt", "annotated_*.txt", "normalized_*.txt",
+                "high_*.txt", "*_per_frame.txt", "*.map"):
+        for fn in glob.glob(pat):
             shutil.move(fn, os.path.join(outdir, fn))
 
     for path in frames:

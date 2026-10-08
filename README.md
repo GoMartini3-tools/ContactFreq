@@ -44,7 +44,7 @@ If both `.pdb` and `.cif` exist for the same index, PDB is preferred.
 
 ## Step 2 - compute high-frequency contacts and build CG model
 
-The main script is `contact_analysis.py` (formerly `contact_calculation.py`). It:
+The main script is `contact_freq.py` (formerly `contact_calculation.py`). It:
 
 - Generates `.map` files for each frame (parallelized).
 - Filters contacts using nm thresholds (`--go-low`, `--go-up`).
@@ -65,7 +65,7 @@ The main script is `contact_analysis.py` (formerly `contact_calculation.py`). It
 ## Typical run
 
 ```bash
-python contact_analysis.py   --cm /path/to/contact_map   --type inter   --cpus 15   --threshold 0.7   --merge all   --dssp /usr/bin/mkdssp   --from charmm   --go-eps 15.0   --go-low 0.3   --go-up 1.1   --add-missing
+python contact_freq.py   --cm /path/to/contact_map   --type inter   --cpus 15   --threshold 0.7   --merge all   --dssp /usr/bin/mkdssp   --from charmm   --go-eps 15.0   --go-low 0.3   --go-up 1.1   --add-missing
 ```
 
 ---
@@ -77,8 +77,8 @@ python contact_analysis.py   --cm /path/to/contact_map   --type inter   --cpus 1
   *For monomers, use `intra`.*
 - `--cpus` (int, `15`): parallel workers for mapping
 - `--threshold` (float, `0.7`): high-frequency cutoff
-- `--merge` (`all|None`, `None`): chains to merge before martinize2 (`all` merges every chain)
-- `--dssp` (str|None, `None`): path to `mkdssp`
+- `--merge` (`all|A,B|None`, `None`): chains to merge before martinize2 (`all` merges every chain). Repeatable for several groups, e.g. `--merge A,B --merge C,D`
+- `--dssp` (optional, `None`): path to `mkdssp`. `--dssp` with no value lets martinize2 use mdtraj. DSSP is optional; mutually exclusive with `--ss`. If neither `--dssp` nor `--ss` is given, a note is printed and the topology is built without secondary structure information
 - `--from` (`amber|charmm`, `"amber"`): source force field for martinize2
 - `--posres` (`none|all|backbone`, `"none"`): position restraints
 
@@ -112,6 +112,15 @@ python contact_analysis.py   --cm /path/to/contact_map   --type inter   --cpus 1
 - `-v` (repeatable): increase martinize2 verbosity
 - `--maxwarn` (list of `int`)
 
+**Input selection, custom force fields and passthrough:**
+
+- `--ignore` (list of `str`): residue names martinize2 ignores, e.g. `HOH LIG`
+- `--model` (int): MODEL to read from multi-model PDB frames
+- `--ff` (str, `"martini3001"`), `--ff-dir`, `--map-dir` (lists): target force field and extra force field / mapping directories for martinize2 (e.g. custom ligand parameters)
+- `--posres-fc` (float): position restraint force constant (kJ/mol/nm^2), martinize2 `-pf`
+- `--min-seq-sep` (int, `4`): minimum residue separation for intra-chain contacts in the frequency analysis. Contacts between different chains are never filtered by sequence separation. Not equivalent to `--go-res-dist`, which is a graph distance applied by martinize2
+- `--martinize-extra` (str): any other martinize2 flags as one string, using the `=` form, e.g. `--martinize-extra="-bonds-fudge 1.4"`
+
 **Reference frame:**
 
 - `--force-frame` (int or `None`): use a specific `frame_####` instead of auto-selection
@@ -120,7 +129,7 @@ python contact_analysis.py   --cm /path/to/contact_map   --type inter   --cpus 1
 
 - `--add-missing` (flag): append high-frequency pairs from `missing_high_freq.itp` into the final `go_nbparams.itp`. The script includes the `[ nonbond_params ]` header on append, and no extra blank line is added. Distances for these pairs are average CA–CA over all frames (in nm), and only pairs with average ≤ `--go-up` are kept.
 
-Run `python contact_analysis.py -h` to view all flags with their default values.
+Run `python contact_freq.py -h` to view all flags with their default values.
 
 ---
 
@@ -128,7 +137,7 @@ Run `python contact_analysis.py -h` to view all flags with their default values.
 
 When building `missing_high_freq.itp`, the script scans all frames and measures CA–CA distances for each missing high-frequency contact.
 
-- PDB frames: MDAnalysis positions are in angstroms. They are converted to nm by dividing by 10.
+- PDB frames: CA coordinates are read directly from the ATOM/HETATM records (first MODEL, first alternate location) in angstroms and converted to nm by dividing by 10. Frames are processed in parallel with `--cpus` workers.
 - CIF frames: a lightweight mmCIF reader provides angstrom coordinates, then the script converts to nm by dividing by 10.
 
 It then averages per-pair distances across all frames (nm) and keeps the pair only if `average_distance ≤ --go-up`.
