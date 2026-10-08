@@ -14,6 +14,7 @@ Fixes and improvements applied on top of `contact_freq.py` (including the `--ff`
 - `-cys` is no longer passed twice to martinize2; `next(hf)` on an empty file no longer raises; `run.log` is no longer written for `-h`.
 
 ### Changed
+- Command-line options of `contact_freq.py`, `traj_to_pdb.py` and `traj_to_cif.py` now use a single dash, as in martinize2 (`-dssp`, `-merge`, `-go-eps`, `-trajectory`, ...). The double-dash spelling is still accepted and translated with a deprecation note. Abbreviated option names are no longer accepted.
 - Distances for missing contacts are computed by reading CA records directly and in parallel, replacing one MDAnalysis selection per pair and frame.
 - Duplicate bead pairs are removed from `missing_high_freq.itp`.
 - The Go site prefix is a single constant (`MOLNAME`).

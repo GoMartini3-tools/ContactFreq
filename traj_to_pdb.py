@@ -5,11 +5,11 @@ Then postprocess PDBs: renumber residues, assign chain IDs, standardize residue 
 and drop specific atom names. Also fixes ILE CD -> CD1.
 
 Usage:
-  python traj_to_pdb.py --trajectory trajectory.xtc --topology topology.pdb \
-      --ranges 1-123,124-246,247-369 --outdir . --stride 1 [--keepH]
+  python traj_to_pdb.py -trajectory trajectory.xtc -topology topology.pdb \
+      -ranges 1-123,124-246,247-369 -outdir . -stride 1 [-keepH]
 
 Notes:
-  - By default hydrogens are removed (use --keepH to keep them).
+  - By default hydrogens are removed (use -keepH to keep them).
   - Residue renames:
         CYX -> CYS
         HSE/HSD/HID/HIE/HSP -> HIS
@@ -18,6 +18,7 @@ Notes:
 """
 
 import argparse
+import sys
 import os
 import glob
 import MDAnalysis as mda
@@ -256,25 +257,44 @@ def standardize_text_like_files(directory, extensions=None):
 
 # --- main ---
 
+def _normalize_legacy_flags(argv, parser):
+    """Options use a single dash (martinize2 style); the former double-dash
+    spelling of known options is still accepted, with a deprecation note."""
+    known = {s for a in parser._actions for s in a.option_strings
+             if s.startswith("-") and not s.startswith("--")}
+    out, legacy = [], []
+    for tok in argv:
+        head, sep, tail = tok.partition("=")
+        if head.startswith("--") and len(head) > 2 and head != "--help" and ("-" + head[2:]) in known:
+            legacy.append(head)
+            tok = "-" + head[2:] + sep + tail
+        out.append(tok)
+    if legacy:
+        print("NOTE: double-dash options are deprecated, use the single-dash form "
+              f"({', '.join(sorted(set(legacy)))}).", file=sys.stderr, flush=True)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Convert trajectory frames to PDB by chain ranges, then postprocess."
     )
-    parser.add_argument('--trajectory', required=True, help='Trajectory file (xtc, dcd, trr, etc.)')
-    parser.add_argument('--topology', required=True, help='Topology file (pdb, gro, psf, etc.)')
+    parser.add_argument('-trajectory', required=True, help='Trajectory file (xtc, dcd, trr, etc.)')
+    parser.add_argument('-topology', required=True, help='Topology file (pdb, gro, psf, etc.)')
     parser.add_argument(
-        '--ranges',
+        '-ranges',
         required=True,
         help='Residue ranges per chain, e.g., 1-123,124-246,247-369'
     )
-    parser.add_argument('--outdir', default='.', help='Output directory')
-    parser.add_argument('--stride', type=int, default=1, help='Frame stride')
+    parser.add_argument('-outdir', default='.', help='Output directory')
+    parser.add_argument('-stride', type=int, default=1, help='Frame stride')
     parser.add_argument(
-        '--keepH',
+        '-keepH',
         action='store_true',
         help='Keep hydrogen atoms (default: remove hydrogens)'
     )
-    args = parser.parse_args()
+    args = parser.parse_args(_normalize_legacy_flags(sys.argv[1:], parser))
 
     residue_ranges = parse_ranges(args.ranges)
     u = mda.Universe(args.topology, args.trajectory)

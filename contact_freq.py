@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# updated: 23-12-2025
+# updated: 08-10-2026
 """
 Comprehensive contact analysis pipeline including martinize2.
 
@@ -8,7 +8,7 @@ If CIF frames are present, they are used directly so chain IDs are preserved.
 
 This script performs the following steps:
   1. Generate contact maps for each frame (.pdb or .cif)
-  2. Clean and filter contacts by distance and flags (distance thresholds in nm via --go-low and --go-up)
+  2. Clean and filter contacts by distance and flags (distance thresholds in nm via -go-low and -go-up)
   3. Annotate intra and inter chain contacts
   4. Compute contact frequencies and identify high-frequency pairs
   5. Select the single reference frame with the most high-frequency contacts
@@ -19,10 +19,14 @@ This script performs the following steps:
  10. Move final .txt, .map and frame files into an output_files folder
 
 Usage:
-  python contact_calculation.py [options]
-  e.g. python contact_calculation.py --type both --merge all --dssp mkdssp --go-eps 15 --from charmm --cm /home/phoenix/software/
+  python contact_freq.py [options]
+  e.g. python contact_freq.py -type both -merge all -dssp mkdssp -go-eps 15 -from charmm -cm /home/phoenix/software/
 
-Run `python contact_calculation.py -h` to see all available flags.
+Options use a single dash, as in martinize2 (-dssp, -merge, -go-eps, ...).
+The former double-dash spelling (--dssp, --merge, ...) is still accepted and
+translated, with a deprecation note.
+
+Run `python contact_freq.py -h` to see all available flags.
 """
 
 import os
@@ -173,7 +177,7 @@ def process_contact_map(args):
 def run_contact_map(frames, cm_dir, cpus):
     exe = os.path.join(cm_dir, "contact_map")
     if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
-        raise FileNotFoundError(f"contact_map executable not found or not executable: {exe} (use --cm)")
+        raise FileNotFoundError(f"contact_map executable not found or not executable: {exe} (use -cm)")
     failed = []
     with Pool(cpus) as pool:
         for in_file, rc, err in tqdm(pool.imap_unordered(
@@ -188,7 +192,7 @@ def run_contact_map(frames, cm_dir, cpus):
     if failed:
         print(f"WARNING: contact_map reported errors on {len(failed)} of {len(frames)} frames")
         if all(os.path.getsize(os.path.splitext(p)[0] + ".map") == 0 for p in frames):
-            raise RuntimeError("contact_map produced empty maps for every frame; check --cm and the inputs")
+            raise RuntimeError("contact_map produced empty maps for every frame; check -cm and the inputs")
 
 def clean_maps(src, backup, header_regex):
     """
@@ -644,128 +648,151 @@ def _missing_distances(task):
             dist.append(float(np.linalg.norm(np.asarray(p1, dtype=float) - np.asarray(p2, dtype=float))) / 10.0)
     return np.array(idx, dtype=int), np.array(dist, dtype=float)
 
+# ---------------- command line ----------------
+
+def _normalize_legacy_flags(argv, parser):
+    """
+    Options use a single dash (martinize2 style). For backward compatibility the
+    former double-dash spelling of any known option (e.g. --dssp, --go-eps=15)
+    is translated to the single-dash form, with a one-line deprecation note.
+    """
+    known = {s for a in parser._actions for s in a.option_strings
+             if s.startswith("-") and not s.startswith("--")}
+    out, legacy = [], []
+    for tok in argv:
+        head, sep, tail = tok.partition("=")
+        if head.startswith("--") and len(head) > 2 and head != "--help" and ("-" + head[2:]) in known:
+            legacy.append(head)
+            tok = "-" + head[2:] + sep + tail
+        out.append(tok)
+    if legacy:
+        print("NOTE: double-dash options are deprecated, use the single-dash form "
+              f"({', '.join(sorted(set(legacy)))}).", file=sys.stderr, flush=True)
+    return out
+
 # ---------------- main ----------------
 
 def main():
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Run full contact analysis and build coarse-grained model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    parser.add_argument("--cm", default=".", help="Path to contact_map executable directory")
-    parser.add_argument("--type", choices=["both","intra","inter"], default="both", help="Contact type")
-    parser.add_argument("--cpus", type=int, default=15, help="Number of parallel processes")
-    parser.add_argument("--threshold", type=float, default=0.7, help="Frequency threshold for high-frequency contacts")
+    parser.add_argument("-cm", default=".", help="Path to contact_map executable directory")
+    parser.add_argument("-type", choices=["both","intra","inter"], default="both", help="Contact type")
+    parser.add_argument("-cpus", type=int, default=15, help="Number of parallel processes")
+    parser.add_argument("-threshold", type=float, default=0.7, help="Frequency threshold for high-frequency contacts")
 
     # martinize2 related arguments
-    parser.add_argument("--merge", action="append", default=None,
+    parser.add_argument("-merge", action="append", default=None,
                         help="Chains to merge (e.g. A,B) or 'all'; may be repeated for several groups")
 
     # optional DSSP
-    parser.add_argument("--dssp", dest="dssp_path", nargs="?", const="", default=None,
-                        help="Optional. Path to dssp executable; give --dssp without a value to let martinize2 use mdtraj")
+    parser.add_argument("-dssp", dest="dssp_path", nargs="?", const="", default=None,
+                        help="Optional. Path to dssp executable; give -dssp without a value to let martinize2 use mdtraj")
 
     # position restraints
-    parser.add_argument("--posres", choices=["none", "all", "backbone"], default="none",
+    parser.add_argument("-posres", choices=["none", "all", "backbone"], default="none",
                         help="Output position restraints")
 
     # manual secondary structure
-    parser.add_argument("--ss", type=str, default=None, help="Manual secondary structure string or single letter")
+    parser.add_argument("-ss", type=str, default=None, help="Manual secondary structure string or single letter")
 
     # Go model controls and contact thresholds in nm
-    parser.add_argument("--go-eps", dest="go_eps", type=float, default=9.414, help="Epsilon for go potential")
-    parser.add_argument("--go-low", dest="go_low", type=float, default=0.3,
+    parser.add_argument("-go-eps", dest="go_eps", type=float, default=9.414, help="Epsilon for go potential")
+    parser.add_argument("-go-low", dest="go_low", type=float, default=0.3,
                         help="Minimum contact distance threshold in nm")
-    parser.add_argument("--go-up", dest="go_up", type=float, default=1.1,
+    parser.add_argument("-go-up", dest="go_up", type=float, default=1.1,
                         help="Maximum contact distance threshold in nm")
-    parser.add_argument("--go-res-dist", dest="go_res_dist", type=int, default=None,
+    parser.add_argument("-go-res-dist", dest="go_res_dist", type=int, default=None,
                         help="Minimum graph distance below which contacts are removed")
-    parser.add_argument("--go-write-file", dest="go_write_file", nargs="?", const="", default=None,
+    parser.add_argument("-go-write-file", dest="go_write_file", nargs="?", const="", default=None,
                         help="Write contact map when Martinize2 calculates it; optional output path")
-    parser.add_argument("--go-backbone", dest="go_backbone", type=str, default="BB",
+    parser.add_argument("-go-backbone", dest="go_backbone", type=str, default="BB",
                         help="Backbone bead name for Go site")
-    parser.add_argument("--go-atomname", dest="go_atomname", type=str, default="CA",
+    parser.add_argument("-go-atomname", dest="go_atomname", type=str, default="CA",
                         help="Virtual Go site atom name")
                         
-    parser.add_argument("--ff", dest="to_ff", default="martini3001",
+    parser.add_argument("-ff", dest="to_ff", default="martini3001",
                     help="Coarse-grained force field for martinize2")
 
-    parser.add_argument("--ff-dir", dest="extra_ff_dir", nargs="+", default=None,
+    parser.add_argument("-ff-dir", dest="extra_ff_dir", nargs="+", default=None,
                     help="Additional repository paths for custom force fields")
 
-    parser.add_argument("--map-dir", dest="extra_map_dir", nargs="+", default=None,
+    parser.add_argument("-map-dir", dest="extra_map_dir", nargs="+", default=None,
                     help="Additional repository paths for mapping files")
 
 
     # Water bias options
-    parser.add_argument("--water-bias", dest="water_bias", action="store_true",
+    parser.add_argument("-water-bias", dest="water_bias", action="store_true",
                         help="Apply water bias to secondary structure elements")
-    parser.add_argument("--water-bias-eps", dest="water_bias_eps", nargs="+", default=None,
+    parser.add_argument("-water-bias-eps", dest="water_bias_eps", nargs="+", default=None,
                         help="Water bias strengths like H:3.6 C:2.1 idr:2.1")
-    parser.add_argument("--id-regions", dest="id_regions", nargs="+", default=None,
+    parser.add_argument("-id-regions", dest="id_regions", nargs="+", default=None,
                         help="Disordered regions as [chain-]start:end tokens")
-    parser.add_argument("--idr-tune", dest="idr_tune", action="store_true",
+    parser.add_argument("-idr-tune", dest="idr_tune", action="store_true",
                         help="Tune IDR regions with specific bonded potentials (deprecated)")
 
     # Protein description / modifications
-    parser.add_argument("--noscfix", dest="noscfix", action="store_true",
+    parser.add_argument("-noscfix", dest="noscfix", action="store_true",
                         help="Do not apply side chain corrections")
-    parser.add_argument("--scfix", dest="scfix", action="store_true",
+    parser.add_argument("-scfix", dest="scfix", action="store_true",
                         help="Legacy scfix flag")
-    parser.add_argument("--cys", dest="cys", default=None, help="Cystein bonds setting")
-    parser.add_argument("--mutate", dest="mutate", nargs="+", default=None,
+    parser.add_argument("-cys", dest="cys", default=None, help="Cystein bonds setting")
+    parser.add_argument("-mutate", dest="mutate", nargs="+", default=None,
                         help="Mutations like A-PHE45:ALA PHE30:ALA")
-    parser.add_argument("--modify", dest="modify", nargs="+", default=None,
+    parser.add_argument("-modify", dest="modify", nargs="+", default=None,
                         help="Residue modifications like A-ASP45:ASP0 ASP:ASP0 +HSE")
 
     # Termini patches
-    parser.add_argument("--nter", dest="nter", action="append", default=None,
+    parser.add_argument("-nter", dest="nter", action="append", default=None,
                         help="Patch for N-termini")
-    parser.add_argument("--cter", dest="cter", action="append", default=None,
+    parser.add_argument("-cter", dest="cter", action="append", default=None,
                         help="Patch for C-termini")
-    parser.add_argument("--nt", dest="neutral_termini", action="store_true",
+    parser.add_argument("-nt", dest="neutral_termini", action="store_true",
                         help="Set neutral termini")
 
     # source force field
-    parser.add_argument("--from", dest="md_source", choices=["amber","charmm"], default=None,
+    parser.add_argument("-from", dest="md_source", choices=["amber","charmm"], default=None,
                         help="Source force field for martinize2")
 
     # Debugging / diagnostics passthrough
-    parser.add_argument("--write-graph", dest="write_graph", default=None, help="Write graph after MakeBonds")
-    parser.add_argument("--write-repair", dest="write_repair", default=None, help="Write graph after RepairGraph")
-    parser.add_argument("--write-canon", dest="write_canon", default=None, help="Write graph after CanonicalizeModifications")
+    parser.add_argument("-write-graph", dest="write_graph", default=None, help="Write graph after MakeBonds")
+    parser.add_argument("-write-repair", dest="write_repair", default=None, help="Write graph after RepairGraph")
+    parser.add_argument("-write-canon", dest="write_canon", default=None, help="Write graph after CanonicalizeModifications")
     parser.add_argument("-v", dest="vcount", action="count", default=0, help="Increase Martinize2 verbosity")
-    parser.add_argument("--maxwarn", dest="maxwarn_list", nargs="+", default=None,
+    parser.add_argument("-maxwarn", dest="maxwarn_list", nargs="+", default=None,
                         help="Maximum allowed warnings for Martinize2")
 
     # Additional martinize2 passthrough and script-level options
-    parser.add_argument("--ignore", dest="ignore", nargs="+", default=None,
+    parser.add_argument("-ignore", dest="ignore", nargs="+", default=None,
                         help="Residue names martinize2 should ignore, e.g. HOH LIG")
-    parser.add_argument("--model", type=int, default=None, help="MODEL number to read (multi-model PDB)")
-    parser.add_argument("--posres-fc", dest="posres_fc", type=float, default=None,
+    parser.add_argument("-model", type=int, default=None, help="MODEL number to read (multi-model PDB)")
+    parser.add_argument("-posres-fc", dest="posres_fc", type=float, default=None,
                         help="Position restraint force constant in kJ/mol/nm^2 (martinize2 -pf)")
-    parser.add_argument("--min-seq-sep", dest="min_seq_sep", type=int, default=4,
+    parser.add_argument("-min-seq-sep", dest="min_seq_sep", type=int, default=4,
                         help="Minimum residue separation for intra-chain contacts in the frequency analysis "
-                             "(not equivalent to martinize2 --go-res-dist, which is a graph distance)")
-    parser.add_argument("--martinize-extra", dest="martinize_extra", default="",
-                        help='Extra martinize2 flags as one string, use the = form, e.g. --martinize-extra="-bonds-fudge 1.4"')
+                             "(not equivalent to martinize2 -go-res-dist, which is a graph distance)")
+    parser.add_argument("-martinize-extra", dest="martinize_extra", default="",
+                        help='Extra martinize2 flags as one string, use the = form, e.g. -martinize-extra="-bonds-fudge 1.4"')
 
     # Append missing high-frequency contacts
-    parser.add_argument("--add-missing", dest="add_missing", action="store_true",
+    parser.add_argument("-add-missing", dest="add_missing", action="store_true",
                         help="Append entries from missing_high_freq.itp into go_nbparams.itp to include all high-frequency contacts")
 
     # optional: force a specific frame index
-    parser.add_argument("--force-frame", type=int, default=None,
+    parser.add_argument("-force-frame", type=int, default=None,
                         help="Use this specific frame index for martinize2")
 
     # NEW FLAG: sigma recalculation
-    parser.add_argument("--sigma", dest="sigma", action="store_true",
+    parser.add_argument("-sigma", dest="sigma", action="store_true",
                         help="Recalculate sigma values from selected frame and replace them in go_nbparams.itp")
 
-    args = parser.parse_args()
+    args = parser.parse_args(_normalize_legacy_flags(sys.argv[1:], parser))
 
     if args.dssp_path is not None and args.ss:
-        parser.error("--dssp and --ss are mutually exclusive")
+        parser.error("-dssp and -ss are mutually exclusive")
 
     # Log the command used to run the script
     with open("run.log", "a") as log_file:
@@ -778,8 +805,8 @@ def main():
             log_file.write(f"[{stamp}] martinize2 version: unavailable\n")
 
     if args.dssp_path is None and not args.ss:
-        print("NOTE: neither --dssp nor --ss given; martinize2 will build the topology without "
-              "secondary structure information (warning suppressed by --maxwarn).", flush=True)
+        print("NOTE: neither -dssp nor -ss given; martinize2 will build the topology without "
+              "secondary structure information (warning suppressed by -maxwarn).", flush=True)
 
     # discover frames
     frames_map = list_frames()
@@ -837,7 +864,7 @@ def main():
     # choose frame
     if args.force_frame is not None:
         if args.force_frame not in available_map:
-            raise FileNotFoundError(f"--force-frame {args.force_frame} has no frame file in . or output_files/")
+            raise FileNotFoundError(f"-force-frame {args.force_frame} has no frame file in . or output_files/")
         frame_idx = int(args.force_frame)
         atom_path = available_map[frame_idx]
     else:
